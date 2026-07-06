@@ -8,15 +8,18 @@ Add this to your Claude Code MCP config (`~/.claude/mcp.json` or `.mcp.json` in 
 
 ```json
 {
-  "mcpServers": {
-    "teamboard": {
-      "command": "npx",
-      "args": ["-y", "github:your-org/teamboard-mcp"],
-      "env": {
-        "TEAMBOARD_BASE_URL": "https://your-teamboard-url.com",
-        "TEAMBOARD_TOKEN": "tbp_your_personal_token"
-      }
-    }
+    "mcpServers": {
+    "teamboard": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "github:uplsuman/teamboard-mcp"
+      ],
+      "env": {
+        "TEAMBOARD_BASE_URL": "https://teamboard.utplco.com",
+        "TEAMBOARD_TOKEN": ""
+      }
+    }
   }
 }
 ```
