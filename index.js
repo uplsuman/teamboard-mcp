@@ -108,6 +108,52 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  'edit_teamboard_task',
+  {
+    title: 'Edit TeamBoard task',
+    description: 'Edit a task in TeamBoard. You can update the title and/or description of the task.',
+    inputSchema: {
+      taskId: z.string().describe('The ID of the task to edit (e.g. TASK-123 or database ObjectId)'),
+      title: z.string().optional().describe('The new title for the task'),
+      description: z.string().optional().describe('The new description for the task'),
+    },
+  },
+  async (args) => {
+    if (!args.title && !args.description) {
+      return {
+        content: [{ type: 'text', text: 'Error: You must provide at least a title or a description to update.' }],
+        isError: true,
+      };
+    }
+
+    const form = new FormData();
+    if (args.title) form.append('title', args.title);
+    if (args.description) form.append('description', args.description);
+
+    const res = await fetch(`${BASE_URL}/api/tasks/${args.taskId}`, {
+      method: 'PATCH',
+      headers: authHeaders,
+      body: form,
+    });
+
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || !json.success) {
+      return {
+        content: [{ type: 'text', text: `Edit failed (${res.status}): ${json.message || 'unknown error'}` }],
+        isError: true,
+      };
+    }
+
+    const task = json.data;
+    const taskId = task?.taskId || args.taskId;
+    const url = `${BASE_URL}/task?id=${taskId}`;
+    return {
+      content: [{ type: 'text', text: `Task ${taskId} updated successfully.\n${url}` }]
+    };
+  }
+);
+
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
