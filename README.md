@@ -29,7 +29,9 @@ Replace `your-org` with the actual GitHub org/user, and generate your token from
 ## Tools
 
 - **`search_teamboard_tasks`** — search tasks by keyword before creating (duplicate check). Returns task IDs and URLs.
+- **`get_teamboard_task`** — fetch full details for a task by ID (`TB-042` or ObjectId): description, status, priority, type, project, assignee, reporters, dates, progress, tags.
 - **`create_teamboard_task`** — create a task. Requires `title`, `projectCode` (e.g. `TB`), `type`, and `priority`. Optional: `description`, `assignee`, `dueDate`.
+- **`edit_teamboard_task`** — update a task's `title` and/or `description` by ID.
 
 ## Local setup (for development)
 

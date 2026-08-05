@@ -26,7 +26,7 @@ const typesText = taskTypes.length ? taskTypes.join(', ') : 'Task, Bug, Feature,
 const prioritiesText = priorities.length ? priorities.join(', ') : 'Blocker, Critical, Highest, High, Medium, Low, Minor';
 
 // ── server ────────────────────────────────────────────────────────────────────
-const server = new McpServer({ name: 'teamboard', version: '0.3.0' });
+const server = new McpServer({ name: 'teamboard', version: '0.4.0' });
 
 server.registerTool(
   'search_teamboard_tasks',
@@ -51,9 +51,66 @@ server.registerTool(
     const lines = tasks.map((t) => {
       const proj = t.project && typeof t.project === 'object' ? (t.project.title ?? t.project.name) : undefined;
       const url = `${BASE_URL}/task?id=${t.taskId}`;
-      return `- ${t.taskId} — ${t.title}${t.status ? ` [${t.status}]` : ''}${proj ? ` (${proj})` : ''}\n  ${url}`;
+      return `- ${t.taskId} — ${t.title}${t.status ? ` [${t.status}]` : ''}${proj ? ` (${proj})` : ''} [DB_ID: ${t._id}]\n  ${url}`;
     });
     return { content: [{ type: 'text', text: `Found ${tasks.length} task(s):\n${lines.join('\n')}` }] };
+  }
+);
+
+const stripHtml = (html) => html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+
+const formatDate = (iso) => {
+  if (!iso) return 'Not provided';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return 'Not provided';
+  // A due date landing exactly on midnight has no meaningful time set (TB-041 default).
+  const hasTime = !(d.getHours() === 23 && d.getMinutes() === 59) && !(d.getHours() === 0 && d.getMinutes() === 0);
+  return d.toLocaleString('en-US', {
+    month: 'short', day: 'numeric', year: 'numeric',
+    ...(hasTime ? { hour: 'numeric', minute: '2-digit' } : {}),
+  });
+};
+
+server.registerTool(
+  'get_teamboard_task',
+  {
+    title: 'Get TeamBoard task details',
+    description: 'Fetch full details for a single TeamBoard task by ID — description, status, priority, type, project, assignee, reporters, dates, progress, and tags.',
+    inputSchema: {
+      taskId: z.string().describe('The task ID (e.g. TB-042) or database ObjectId'),
+    },
+  },
+  async (args) => {
+    const res = await fetch(`${BASE_URL}/api/tasks/${args.taskId}`, { headers: authHeaders });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || !json.success) {
+      return { content: [{ type: 'text', text: `Fetch failed (${res.status}): ${json.message || 'unknown error'}` }], isError: true };
+    }
+    const t = json.data;
+    const url = `${BASE_URL}/task?id=${t.taskId}`;
+    const project = t.project && typeof t.project === 'object' ? (t.project.title ?? t.project.projectCode) : undefined;
+    const assignee = t.assignee && typeof t.assignee === 'object' ? t.assignee.name : undefined;
+    const reporters = Array.isArray(t.owners) ? t.owners.map((o) => (typeof o === 'object' ? o.name : o)).join(', ') : undefined;
+    const parent = t.parentTask && typeof t.parentTask === 'object' ? `${t.parentTask.taskId} — ${t.parentTask.title}` : undefined;
+    const tags = Array.isArray(t.tags) ? t.tags.map((tag) => (typeof tag === 'object' ? tag.name : tag)).join(', ') : undefined;
+
+    const lines = [
+      `${t.taskId} — ${t.title}`,
+      `Type: ${t.taskType || 'Task'}  Status: ${t.status || 'To Do'}  Priority: ${t.priority || 'None'}  Progress: ${t.progress ?? 0}%`,
+      `Project: ${project || 'None'}`,
+      `Assignee: ${assignee || 'Unassigned'}`,
+      `Reporters: ${reporters || 'None'}`,
+      `Start Date: ${formatDate(t.startDate)}`,
+      `Due Date: ${formatDate(t.endDate)}`,
+      ...(parent ? [`Parent: ${parent}`] : []),
+      ...(tags ? [`Tags: ${tags}`] : []),
+      '',
+      'Description:',
+      t.description ? stripHtml(t.description) : '(none)',
+      '',
+      url,
+    ];
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
   }
 );
 
