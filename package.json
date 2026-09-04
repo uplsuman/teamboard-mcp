@@ -1,11 +1,22 @@
 {
   "name": "teamboard-mcp",
-  "version": "0.1.0",
+  "version": "0.5.0",
   "type": "module",
-  "bin": { "teamboard-mcp": "index.js" },
-  "engines": { "node": ">=18" },
+  "bin": {
+    "teamboard-mcp": "index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
     "zod": "^3.23.8"
-  }
+  },
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "files": [
+    "index.js",
+    "resolve.js"
+  ]
 }

@@ -1,0 +1,131 @@
+// Run: node test.mjs   (no framework, no network — fetch is stubbed)
+//
+// Covers the resolution layer, which is the whole reason this server exists:
+// a caller passes a human reference and must either get the right row or a
+// message listing the candidates. Never a silent wrong write.
+import assert from 'node:assert/strict';
+import {
+  formatDate, isClear, isObjectId, looksLikeTaskId, normalizeValue, pickOne,
+  resolveProject, resolveTask, resolveUser,
+} from './resolve.js';
+
+process.env.TEAMBOARD_TOKEN = 'tbp_test';
+
+// ── fetch stub: route → payload, plus a log of what was requested ────────────
+let routes = {};
+const calls = [];
+globalThis.fetch = async (url, init = {}) => {
+  const path = url.replace(/^https?:\/\/[^/]+/, '');
+  calls.push(`${init.method || 'GET'} ${path}`);
+  const match = Object.keys(routes).find((r) => path.startsWith(r));
+  if (!match) return { ok: false, status: 404, json: async () => ({ success: false, message: 'Not found' }) };
+  const body = routes[match];
+  if (body.__status) return { ok: false, status: body.__status, json: async () => ({ success: false, message: body.__message }) };
+  return { ok: true, status: 200, json: async () => ({ success: true, data: body }) };
+};
+const stub = (r) => { routes = r; calls.length = 0; };
+const rejects = async (fn, re) => {
+  await assert.rejects(fn, (err) => (assert.match(err.message, re), true));
+};
+
+// ── pure helpers ─────────────────────────────────────────────────────────────
+assert.ok(isObjectId('507f1f77bcf86cd799439011'));
+assert.ok(!isObjectId('TASK-42'));
+assert.ok(looksLikeTaskId('TASK-42') && looksLikeTaskId(' task-1 ') && looksLikeTaskId('TB-007'));
+assert.ok(!looksLikeTaskId('Fix the login page'));
+assert.ok(isClear('none') && isClear('  Unassigned ') && isClear('__none__'));
+assert.ok(!isClear('Priya'));
+
+// An exact match beats a longer name that merely contains the same prefix.
+const people = [{ name: 'Sam' }, { name: 'Samantha' }];
+assert.equal(pickOne(people, 'sam', ['name']).name, 'Sam');
+assert.equal(pickOne(people, 'saman', ['name']).name, 'Samantha');
+assert.equal(pickOne(people, 'sa', ['name']), null); // ambiguous → caller must say more
+
+assert.equal(normalizeValue('bug', ['Task', 'Bug'], 'task type'), 'Bug');
+assert.throws(() => normalizeValue('Epci', ['Task', 'Bug'], 'task type'), /Unknown task type "Epci". Valid: Task, Bug/);
+assert.equal(normalizeValue('Whatever', [], 'status'), 'Whatever'); // vocab unavailable → pass through
+
+// A date-only value must not grow a time. Checking only the LOCAL clock printed
+// "Sep 30, 2026, 5:30 AM" for "2026-09-30" east of UTC.
+assert.equal(formatDate('2026-09-30'), 'Sep 30, 2026');
+assert.equal(formatDate('2026-09-30T00:00:00.000Z'), 'Sep 30, 2026');
+assert.match(formatDate('2026-09-30T09:15:00.000Z'), /2026, \d/); // a real time survives
+// 23:59 LOCAL is the app's own due-date default; it must keep its local date.
+const eod = new Date(2026, 8, 30, 23, 59);
+assert.equal(formatDate(eod.toISOString()), 'Sep 30, 2026');
+assert.equal(formatDate(null), 'Not provided');
+assert.equal(formatDate('not a date'), 'Not provided');
+
+// ── resolveTask ──────────────────────────────────────────────────────────────
+stub({ '/api/tasks/TASK-42': { taskId: 'TASK-42', title: 'Real task' } });
+assert.equal((await resolveTask('TASK-42')).title, 'Real task');
+assert.deepEqual(calls, ['GET /api/tasks/TASK-42']); // id-shaped → one direct fetch
+
+// A title falls through to the title search, then re-fetches the full task.
+stub({
+  '/api/tasks?title=': { allTasks: [{ taskId: 'TASK-9', title: 'Login page broken' }] },
+  '/api/tasks/TASK-9': { taskId: 'TASK-9', title: 'Login page broken', status: 'To Do' },
+});
+assert.equal((await resolveTask('Login page broken')).status, 'To Do');
+
+// An id-shaped ref that is really a title ("Login-2") must not dead-end on the 404.
+stub({
+  '/api/tasks/Login-2': { __status: 404, __message: 'Task not found' },
+  '/api/tasks?title=': { allTasks: [{ taskId: 'TASK-3', title: 'Login-2' }] },
+  '/api/tasks/TASK-3': { taskId: 'TASK-3', title: 'Login-2' },
+});
+assert.equal((await resolveTask('Login-2')).taskId, 'TASK-3');
+
+// A 403 is NOT a miss — it must surface, not be retried as a title.
+stub({ '/api/tasks/TASK-5': { __status: 403, __message: 'Project is locked' } });
+await rejects(() => resolveTask('TASK-5'), /Project is locked/);
+
+// Ambiguity lists the candidates instead of guessing.
+stub({ '/api/tasks?title=': { allTasks: [
+  { taskId: 'TASK-1', title: 'Fix login' }, { taskId: 'TASK-2', title: 'Fix logout' },
+] } });
+await rejects(() => resolveTask('Fix log'), /matches 2 tasks[\s\S]*TASK-1 — Fix login[\s\S]*TASK-2 — Fix logout/);
+
+stub({ '/api/tasks?title=': { allTasks: [] } });
+await rejects(() => resolveTask('nothing like this'), /No task found for "nothing like this"/);
+
+// ── resolveUser ──────────────────────────────────────────────────────────────
+stub({ '/api/users?search=': { users: [
+  { _id: 'u1', name: 'Priya Sharma', email: 'priya@x.com' },
+  { _id: 'u2', name: 'Priyanka Roy', email: 'priyanka@x.com' },
+] } });
+assert.equal(await resolveUser('Priya Sharma'), 'u1');     // exact name
+assert.equal(await resolveUser('priyanka@x.com'), 'u2');   // exact email
+await rejects(() => resolveUser('Priy'), /matches 2 users[\s\S]*Priya Sharma[\s\S]*Priyanka Roy/);
+
+// With a project, the roster is the source of truth — an assignee must be a member.
+stub({ '/api/projects/p1/members': { members: [
+  { role: 'owner', user: { _id: 'u1', name: 'Priya Sharma', email: 'priya@x.com' } },
+] } });
+assert.equal(await resolveUser('Priya', 'p1'), 'u1');
+await rejects(() => resolveUser('Outsider', 'p1'), /doesn't match exactly one member[\s\S]*Priya Sharma/);
+
+// An ObjectId is taken as-is, with no lookup at all.
+stub({});
+assert.equal(await resolveUser('507f1f77bcf86cd799439011'), '507f1f77bcf86cd799439011');
+assert.deepEqual(calls, []);
+
+// ── resolveProject ───────────────────────────────────────────────────────────
+stub({ '/api/projects?search=': { projects: [
+  { _id: 'p1', projectCode: 'TB', title: 'TeamBoard' },
+  { _id: 'p2', projectCode: 'TBX', title: 'TeamBoard Experiments' },
+] } });
+assert.equal((await resolveProject('TB'))._id, 'p1');           // exact code wins over prefix sibling
+assert.equal((await resolveProject('TeamBoard'))._id, 'p1');    // exact title
+await rejects(() => resolveProject('Team'), /matches 2 projects[\s\S]*TB — TeamBoard/);
+
+stub({ '/api/projects?ids=': { projects: [{ _id: '507f1f77bcf86cd799439011', projectCode: 'TB', title: 'TeamBoard' }] } });
+assert.equal((await resolveProject('507f1f77bcf86cd799439011')).projectCode, 'TB');
+assert.ok(calls[0].includes('ids='));
+
+// ── server errors keep their message ─────────────────────────────────────────
+stub({ '/api/tasks/TASK-7': { __status: 400, __message: 'Assignee must be a member of the project' } });
+await rejects(() => resolveTask('TASK-7'), /Assignee must be a member of the project/);
+
+console.log('all resolution checks passed');
