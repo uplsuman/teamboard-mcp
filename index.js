@@ -2,8 +2,10 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { readFile, writeFile } from 'node:fs/promises';
+import { basename, join } from 'node:path';
 import {
-  api, enc, fetchVocab, isClear, normalizeValue,
+  api, apiRaw, attachmentPath, enc, fetchVocab, isClear, normalizeValue,
   resolveProject, resolveTask, resolveUser,
   displayName, formatDate, stripHtml, taskUrl,
 } from './resolve.js';
@@ -32,6 +34,46 @@ const tool = (spec, handler) => server.registerTool(spec.name, spec, async (args
     return { content: [{ type: 'text', text: err.message || String(err) }], isError: true };
   }
 });
+
+// An activity's old/new value is whatever the field held: rich-text HTML for a
+// description or comment, and an object for a link. Interpolating it straight in
+// printed raw markup and "[object Object]".
+const MIME_BY_EXT = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+  webp: 'image/webp', svg: 'image/svg+xml', pdf: 'application/pdf',
+  txt: 'text/plain', csv: 'text/csv', md: 'text/markdown', json: 'application/json',
+  zip: 'application/zip', mp4: 'video/mp4', mov: 'video/quicktime', mp3: 'audio/mpeg',
+  doc: 'application/msword', xls: 'application/vnd.ms-excel',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+};
+const mimeFor = (name) => MIME_BY_EXT[name.split('.').pop()?.toLowerCase()] || 'application/octet-stream';
+
+function historyValue(value) {
+  if (value === null || value === undefined || value === '') return '—';
+  const flat = typeof value === 'object' ? JSON.stringify(value) : stripHtml(String(value));
+  return flat.length > 80 ? `${flat.slice(0, 79)}…` : flat;
+}
+
+// Attachments are addressed by name, not by the storage url the caller cannot know.
+// Deleting the wrong file is unrecoverable, so an ambiguous name lists instead.
+function pickAttachment(task, name) {
+  const docs = task.documents ?? [];
+  if (!docs.length) throw new Error(`${task.taskId} has no attachments.`);
+  const low = String(name).trim().toLowerCase();
+  const key = (d) => d.url?.split('/').pop() ?? '';
+  const exact = docs.filter((d) => d.name?.toLowerCase() === low || key(d).toLowerCase() === low);
+  const partial = docs.filter((d) => d.name?.toLowerCase().includes(low) || key(d).toLowerCase().includes(low));
+  const hit = exact.length === 1 ? exact[0] : partial.length === 1 ? partial[0] : null;
+  if (!hit) {
+    // Two files can share a name, so list the unique storage key alongside it —
+    // that is what disambiguates them.
+    throw new Error(`"${name}" matches ${partial.length || docs.length} attachments on ${task.taskId}:\n`
+      + docs.map((d) => `- ${d.name}  (key: ${key(d)})`).join('\n'));
+  }
+  return hit;
+}
 
 const TASK_REF = z.string().describe('Task ID (TASK-42) or the task title — a title is looked up for you');
 const HTML_NOTE = 'Rich text: pass literal HTML (<h3>, <ul>, <li>, <strong>, <code>, <p>), not plain text with newlines.';
@@ -102,10 +144,16 @@ tool(
   {
     name: 'get_teamboard_task',
     title: 'Get TeamBoard task details',
-    description: 'Fetch full details for one task — description, status, priority, type, project, assignee, reporters, watchers, dates, progress, tags, and optionally its comments.',
+    description: [
+      'Fetch one task: description, status, priority, type, project, assignee, reporters,',
+      'watchers, dates, progress, tags — plus any of its comments, subtasks, linked tasks,',
+      'attachments or change history via `include` (each costs one extra request).',
+      'Comment ids are printed so they can be passed to edit/delete.',
+    ].join(' '),
     inputSchema: {
       task: TASK_REF,
-      withComments: z.boolean().optional().describe('Also include the comment thread'),
+      include: z.array(z.enum(['comments', 'subtasks', 'links', 'attachments', 'history']))
+        .optional().describe('Extra sections to load'),
     },
   },
   async (args) => {
@@ -130,14 +178,46 @@ tool(
       t.description ? stripHtml(t.description) : '(none)',
     ];
 
-    if (args.withComments) {
+    const want = new Set(args.include ?? []);
+    const section = (label, rows) => {
+      lines.push('', `${label} (${rows.length}):`, ...(rows.length ? rows : ['(none)']));
+    };
+
+    if (want.has('comments')) {
       const data = await api(`/api/comments?taskId=${enc(t.taskId)}&limit=50`);
       const comments = data?.comments ?? (Array.isArray(data) ? data : []);
-      lines.push('', `Comments (${comments.length}):`);
-      for (const c of comments) {
-        lines.push(`- ${displayName(c.author) || 'Unknown'} (${formatDate(c.createdAt)}): ${stripHtml(c.content || '')}`);
-      }
-      if (!comments.length) lines.push('(none)');
+      section('Comments', comments.flatMap((c) => [
+        // The id is what edit_teamboard_comment / delete_teamboard_comment need.
+        `- [${c._id}] ${displayName(c.author) || 'Unknown'} (${formatDate(c.createdAt)}): ${stripHtml(c.content || '')}`,
+        ...(c.replies ?? []).map((r) => `    ↳ [${r._id}] ${displayName(r.author) || 'Unknown'}: ${stripHtml(r.content || '')}`),
+      ]));
+    }
+
+    if (want.has('subtasks')) {
+      const subtasks = await api(`/api/tasks/${enc(t.taskId)}/subtasks`);
+      section('Subtasks', (subtasks ?? []).map((st) =>
+        `- ${st.taskId} — ${st.title} [${st.status}]${st.assignee?.name ? ` → ${st.assignee.name}` : ''} ${st.progress ?? 0}%`));
+    }
+
+    if (want.has('links')) {
+      const links = await api(`/api/tasks/${enc(t.taskId)}/links`);
+      section('Linked tasks', (links ?? []).map((l) =>
+        `- ${l.linkType.replace(/_/g, ' ')}: ${l.task?.taskId} — ${l.task?.title} [${l.task?.status}]`));
+    }
+
+    if (want.has('attachments')) {
+      section('Attachments', (t.documents ?? []).map((d) =>
+        `- ${d.name} (${d.fileType || 'file'}, ${Math.round((d.size ?? 0) / 1024)} KB, added ${formatDate(d.uploadedAt)})`));
+    }
+
+    if (want.has('history')) {
+      const activities = await api(`/api/tasks/${enc(t.taskId)}/activities?limit=30`);
+      section('History', (activities ?? []).map((a) => {
+        const change = a.meta?.field
+          ? ` (${a.meta.field}: ${historyValue(a.meta.oldValue)} → ${historyValue(a.meta.newValue)})`
+          : '';
+        return `- ${formatDate(a.createdAt)} ${displayName(a.actor) || 'Someone'}: ${a.message}${change}`;
+      }));
     }
 
     lines.push('', taskUrl(t.taskId));
@@ -347,6 +427,197 @@ tool(
       body: JSON.stringify({ taskId: t.taskId, content: args.comment }),
     });
     return text(`Commented on ${t.taskId}.\n${taskUrl(t.taskId)}`);
+  }
+);
+
+const LINK_TYPES = [
+  'blocks', 'blocked_by', 'clones', 'cloned_by', 'splits_into', 'splits_from',
+  'causes', 'caused_by', 'duplicate_of', 'relates_to',
+];
+
+tool(
+  {
+    name: 'create_teamboard_subtask',
+    title: 'Create a TeamBoard subtask',
+    description: `Add a subtask under an existing task. It inherits the parent's project. Types: ${typesText}. Priorities: ${prioritiesText}.`,
+    inputSchema: {
+      parent: TASK_REF,
+      title: z.string(),
+      description: z.string().optional().describe(HTML_NOTE),
+      type: z.string().optional().describe(`One of: ${typesText} (default Task)`),
+      priority: z.string().optional().describe(`One of: ${prioritiesText}`),
+      assignee: z.string().optional().describe("Person's name or email — must be a member of the parent's project"),
+      dueDate: z.string().optional().describe('YYYY-MM-DD or ISO datetime'),
+    },
+  },
+  async (args) => {
+    const parent = await resolveTask(args.parent);
+    const projectId = parent.project?._id ? String(parent.project._id) : undefined;
+
+    const subtaskData = {
+      title: args.title,
+      taskType: args.type ? normalizeValue(args.type, vocab.taskTypes, 'task type') : 'Task',
+      ...(args.priority ? { priority: normalizeValue(args.priority, vocab.priorities, 'priority') } : {}),
+      ...(args.description ? { description: args.description } : {}),
+      ...(args.assignee ? { assigneeId: await resolveUser(args.assignee, projectId) } : {}),
+      ...(args.dueDate ? { endDate: args.dueDate } : {}),
+    };
+
+    // FormData with a JSON blob, same shape as task creation.
+    const form = new FormData();
+    form.append('subtaskData', JSON.stringify(subtaskData));
+    const created = await api(`/api/tasks/${enc(parent.taskId)}/subtasks`, { method: 'POST', body: form });
+
+    const id = created?.taskId ?? created?.subtask?.taskId;
+    return text(`Created subtask ${id ?? '(id not returned)'} under ${parent.taskId}.\n${taskUrl(id ?? parent.taskId)}`);
+  }
+);
+
+tool(
+  {
+    name: 'link_teamboard_tasks',
+    title: 'Link two TeamBoard tasks',
+    description: `Create a typed relationship between two tasks. The inverse link is implied — linking A blocks B means B is blocked_by A. Types: ${LINK_TYPES.join(', ')}.`,
+    inputSchema: {
+      task: TASK_REF,
+      target: z.string().describe('The other task — ID or title'),
+      type: z.enum(LINK_TYPES).describe('How `task` relates TO `target`'),
+    },
+  },
+  async (args) => {
+    const [from, to] = [await resolveTask(args.task), await resolveTask(args.target)];
+    await api(`/api/tasks/${enc(from.taskId)}/links`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ linkType: args.type, targetTaskId: to.taskId }),
+    });
+    return text(`${from.taskId} ${args.type.replace(/_/g, ' ')} ${to.taskId}.\n${taskUrl(from.taskId)}`);
+  }
+);
+
+tool(
+  {
+    name: 'unlink_teamboard_tasks',
+    title: 'Remove a link between TeamBoard tasks',
+    description: 'Remove the relationship between two tasks, whichever direction it was created in.',
+    inputSchema: {
+      task: TASK_REF,
+      target: z.string().describe('The task on the other end of the link — ID or title'),
+    },
+  },
+  async (args) => {
+    const [from, to] = [await resolveTask(args.task), await resolveTask(args.target)];
+    const links = (await api(`/api/tasks/${enc(from.taskId)}/links`)) ?? [];
+    const hit = links.find((l) => l.task?.taskId === to.taskId);
+    if (!hit) {
+      const listed = links.map((l) => `- ${l.linkType}: ${l.task?.taskId}`).join('\n');
+      throw new Error(`${from.taskId} has no link to ${to.taskId}.${listed ? `\nExisting links:\n${listed}` : ''}`);
+    }
+    await api(`/api/tasks/${enc(from.taskId)}/links/${enc(hit._id)}`, { method: 'DELETE' });
+    return text(`Removed the link between ${from.taskId} and ${to.taskId}.`);
+  }
+);
+
+tool(
+  {
+    name: 'edit_teamboard_comment',
+    title: 'Edit a TeamBoard comment',
+    description: `Rewrite one of your own comments (an admin may edit any). Get the id from get_teamboard_task with include: ["comments"]. ${HTML_NOTE}`,
+    inputSchema: {
+      commentId: z.string().describe('The comment id shown in square brackets by get_teamboard_task'),
+      comment: z.string().describe(`The replacement text. ${HTML_NOTE}`),
+    },
+  },
+  async (args) => {
+    await api(`/api/comments/${enc(args.commentId)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: args.comment }),
+    });
+    return text('Comment updated.');
+  }
+);
+
+tool(
+  {
+    name: 'delete_teamboard_comment',
+    title: 'Delete a TeamBoard comment',
+    description: 'Delete one of your own comments (an admin may delete any). Get the id from get_teamboard_task with include: ["comments"].',
+    inputSchema: {
+      commentId: z.string().describe('The comment id shown in square brackets by get_teamboard_task'),
+    },
+  },
+  async (args) => {
+    await api(`/api/comments/${enc(args.commentId)}`, { method: 'DELETE' });
+    return text('Comment deleted.');
+  }
+);
+
+tool(
+  {
+    name: 'add_teamboard_attachment',
+    title: 'Attach a file to a TeamBoard task',
+    description: 'Upload a local file and attach it to a task.',
+    inputSchema: {
+      task: TASK_REF,
+      filePath: z.string().describe('Absolute path of the local file to upload'),
+      name: z.string().optional().describe('Name to store it under (defaults to the file name)'),
+    },
+  },
+  async (args) => {
+    const t = await resolveTask(args.task);
+    const bytes = await readFile(args.filePath);
+    const filename = args.name || basename(args.filePath);
+
+    // The task PATCH takes attachments in a `file` field, alongside any other edit.
+    const form = new FormData();
+    form.append('file', new Blob([bytes], { type: mimeFor(filename) }), filename);
+    await api(`/api/tasks/${enc(t.taskId)}`, { method: 'PATCH', body: form });
+
+    return text(`Attached ${filename} to ${t.taskId}.\n${taskUrl(t.taskId)}`);
+  }
+);
+
+tool(
+  {
+    name: 'download_teamboard_attachment',
+    title: 'Download a TeamBoard attachment',
+    description: 'Save a task attachment to a local file. List them with get_teamboard_task include: ["attachments"].',
+    inputSchema: {
+      task: TASK_REF,
+      name: z.string().describe('Attachment name, or any distinctive part of it'),
+      saveTo: z.string().optional().describe('Directory to save into (defaults to the current directory)'),
+    },
+  },
+  async (args) => {
+    const t = await resolveTask(args.task);
+    const doc = pickAttachment(t, args.name);
+    const res = await apiRaw(attachmentPath(doc.url));
+    const target = join(args.saveTo || process.cwd(), basename(doc.name));
+    await writeFile(target, Buffer.from(await res.arrayBuffer()));
+    return text(`Saved ${doc.name} from ${t.taskId} to ${target}`);
+  }
+);
+
+tool(
+  {
+    name: 'delete_teamboard_attachment',
+    title: 'Remove a TeamBoard attachment',
+    description: 'Detach a file from a task and delete it from storage.',
+    inputSchema: {
+      task: TASK_REF,
+      name: z.string().describe('Attachment name, or any distinctive part of it'),
+    },
+  },
+  async (args) => {
+    const t = await resolveTask(args.task);
+    const doc = pickAttachment(t, args.name);
+
+    const form = new FormData();
+    form.append('deleteAttachment', doc.url);
+    await api(`/api/tasks/${enc(t.taskId)}`, { method: 'PATCH', body: form });
+
+    return text(`Removed ${doc.name} from ${t.taskId}.`);
   }
 );
 

@@ -23,6 +23,39 @@ export async function api(path, init = {}) {
   return json.data;
 }
 
+// Raw response, for the file-download path — `api()` assumes JSON.
+//
+// `redirect: 'manual'` is load-bearing. A stored attachment url is `/files/...`,
+// which next.config rewrites to this API route — but that path is NOT under /api/*,
+// so middleware sees a page request with no session COOKIE (a bearer means nothing to
+// it) and answers 307 to /auth/login. Following that quietly yields a 200 HTML login
+// page, which the download tool then wrote over the user's file. So: never follow, and
+// address the API route directly (see attachmentPath).
+export async function apiRaw(path) {
+  const res = await fetch(`${BASE_URL}${path}`, {
+    headers: { Authorization: `Bearer ${process.env.TEAMBOARD_TOKEN}` },
+    redirect: 'manual',
+  });
+  if (res.status >= 300 && res.status < 400) {
+    throw new ApiError(
+      `GET ${path} redirected to ${res.headers.get('location') ?? 'elsewhere'} — that path is not token-authenticated.`,
+      res.status
+    );
+  }
+  if (!res.ok) throw new ApiError(`GET ${path} failed (${res.status})`, res.status);
+  const type = res.headers.get('content-type') ?? '';
+  if (type.includes('text/html')) {
+    throw new ApiError(`GET ${path} returned an HTML page, not a file.`, res.status);
+  }
+  return res;
+}
+
+/** A stored attachment url (`/files/...`) as the API route that serves it. */
+export const attachmentPath = (url) => {
+  const clean = url.startsWith('/') ? url : `/${url}`;
+  return clean.startsWith('/api/') ? clean : `/api/uploads${clean}`;
+};
+
 export const isObjectId = (s) => /^[a-f\d]{24}$/i.test(s);
 export const looksLikeTaskId = (s) => /^[A-Za-z][A-Za-z0-9]*-\d+$/.test(String(s).trim());
 

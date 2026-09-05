@@ -5,8 +5,8 @@
 // message listing the candidates. Never a silent wrong write.
 import assert from 'node:assert/strict';
 import {
-  formatDate, isClear, isObjectId, looksLikeTaskId, normalizeValue, pickOne,
-  resolveProject, resolveTask, resolveUser,
+  attachmentPath, formatDate, isClear, isObjectId, looksLikeTaskId, normalizeValue,
+  pickOne, resolveProject, resolveTask, resolveUser,
 } from './resolve.js';
 
 process.env.TEAMBOARD_TOKEN = 'tbp_test';
@@ -132,5 +132,33 @@ assert.deepEqual(calls, ['GET /api/users/me']);
 // ── server errors keep their message ─────────────────────────────────────────
 stub({ '/api/tasks/TASK-7': { __status: 400, __message: 'Assignee must be a member of the project' } });
 await rejects(() => resolveTask('TASK-7'), /Assignee must be a member of the project/);
+
+// ── attachmentPath ───────────────────────────────────────────────────────────
+// A stored url is "/files/...", which next.config rewrites to the API route — but that
+// path is not under /api/*, so middleware 307s a token request to the login page, and
+// following that wrote a 73KB HTML page over the downloaded file. Address the route.
+assert.equal(attachmentPath('/files/documents/a.txt'), '/api/uploads/files/documents/a.txt');
+assert.equal(attachmentPath('files/documents/a.txt'), '/api/uploads/files/documents/a.txt');
+assert.equal(attachmentPath('/api/uploads/files/x.png'), '/api/uploads/files/x.png'); // already routed
+
+// ── pickAttachment ───────────────────────────────────────────────────────────
+// Not exported from index.js (which boots a server on import), so the rule is
+// re-asserted here against the same logic: an ambiguous name must never resolve,
+// because the caller acts on the result by DELETING it.
+const docs = [
+  { name: 'spec-v1.pdf', url: '/files/documents/a.pdf' },
+  { name: 'spec-v2.pdf', url: '/files/documents/b.pdf' },
+  { name: 'screenshot.png', url: '/files/documents/c.png' },
+];
+const pick = (name) => {
+  const low = name.trim().toLowerCase();
+  const exact = docs.filter((d) => d.name.toLowerCase() === low);
+  const partial = docs.filter((d) => d.name.toLowerCase().includes(low));
+  return exact.length === 1 ? exact[0] : partial.length === 1 ? partial[0] : null;
+};
+assert.equal(pick('spec-v1.pdf').url, '/files/documents/a.pdf'); // exact
+assert.equal(pick('screenshot').url, '/files/documents/c.png');  // lone partial
+assert.equal(pick('spec'), null);                                 // ambiguous → refuse
+assert.equal(pick('nothing'), null);
 
 console.log('all resolution checks passed');
