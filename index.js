@@ -50,6 +50,28 @@ const MIME_BY_EXT = {
 };
 const mimeFor = (name) => MIME_BY_EXT[name.split('.').pop()?.toLowerCase()] || 'application/octet-stream';
 
+// A comment can carry files and reactions; without these the thread showed neither,
+// so an attached file was invisible unless you opened the task in a browser.
+const attachmentNote = (c) => {
+  const files = c.attachments ?? [];
+  return files.length ? `  [${files.length} file(s): ${files.map((f) => f.name).join(', ')}]` : '';
+};
+const reactionNote = (c) => {
+  const counts = (c.reactions ?? []).reduce((acc, r) => {
+    acc[r.emoji] = (acc[r.emoji] ?? 0) + 1;
+    return acc;
+  }, {});
+  const shown = Object.entries(counts).map(([e, n]) => `${e}${n > 1 ? n : ''}`).join(' ');
+  return shown ? `  ${shown}` : '';
+};
+
+// One tidy line: strip markup, collapse whitespace, truncate. Notification and
+// activity text is free-form and can run to a paragraph.
+const oneLine = (value, max) => {
+  const flat = stripHtml(String(value ?? ''));
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+};
+
 // Durations come back in seconds.
 const formatDuration = (secs) => {
   const total = Math.round((secs ?? 0) / 60);
@@ -100,7 +122,7 @@ function pickAttachment(task, name) {
 }
 
 const TASK_REF = z.string().describe('Task ID (TASK-42) or the task title — a title is looked up for you');
-const HTML_NOTE = 'Rich text: pass literal HTML (<h3>, <ul>, <li>, <strong>, <code>, <p>), not plain text with newlines.';
+const HTML_NOTE = 'Literal HTML (<p>, <ul>, <li>, <strong>, <code>) — not plain text with newlines.';
 
 tool(
   {
@@ -110,7 +132,6 @@ tool(
       'Find tasks. `query` searches title, description, tags, comments, assignee and project.',
       'The filters combine (AND), so "my open bugs in TB" is assignee + status + type + project — no query needed.',
       'Call BEFORE creating a task to check for duplicates. Results include task IDs and URLs.',
-      `Statuses: ${statusesText}. Priorities: ${prioritiesText}. Types: ${typesText}.`,
     ].join(' '),
     inputSchema: {
       query: z.string().optional().describe('Keyword(s) to search for'),
@@ -122,12 +143,11 @@ tool(
       dueBefore: z.string().optional().describe('Only tasks due on or before this date (YYYY-MM-DD)'),
       dueAfter: z.string().optional().describe('Only tasks due on or after this date (YYYY-MM-DD)'),
       savedFilter: z.string().optional()
-        .describe('Run a saved filter by name (list them with list_teamboard_filters). Its JQL is used unless `jql` is also given.'),
+        .describe('Run a saved filter by name (see list_teamboard_filters); `jql` overrides it.'),
       jql: z.string().optional().describe(
-        'Raw TeamBoard JQL for anything the filters above cannot express, e.g. '
-        + 'status IN ("To Do", "In Progress") AND priority = High ORDER BY due ASC. '
-        + 'Sortable fields are due, start, created, updated, priority, title, status, '
-        + 'assignee — NOT the camelCase column names. The server reports its own errors.'
+        'Raw JQL for what the filters cannot express, e.g. status IN ("To Do", "In Progress") '
+        + 'AND priority = High ORDER BY due ASC. Sort on due/start/created/updated/priority/'
+        + 'title/status/assignee — not camelCase column names.'
       ),
       limit: z.number().int().min(1).max(50).optional().describe('Max results (default 10)'),
     },
@@ -213,28 +233,43 @@ tool(
     ];
 
     const want = new Set(args.include ?? []);
+    // Each section is an independent GET, so fetch them together — five sequential
+    // awaits made a full `include` five round trips deep.
+    const [comments, subtasks, links, activities, timeLogs] = await Promise.all([
+      want.has('comments') ? api(`/api/comments?taskId=${enc(t.taskId)}&limit=50`) : null,
+      want.has('subtasks') ? api(`/api/tasks/${enc(t.taskId)}/subtasks`) : null,
+      want.has('links') ? api(`/api/tasks/${enc(t.taskId)}/links`) : null,
+      want.has('history') ? api(`/api/tasks/${enc(t.taskId)}/activities?limit=30`) : null,
+      want.has('time') ? api(`/api/tasks/${enc(t.taskId)}/time-logs`) : null,
+    ]);
+
+    // Long threads and histories are capped: a task with 200 comments would otherwise
+    // bury everything else in the caller's context.
+    const CAP = 25;
     const section = (label, rows) => {
-      lines.push('', `${label} (${rows.length}):`, ...(rows.length ? rows : ['(none)']));
+      const shown = rows.slice(0, CAP);
+      lines.push('', `${label} (${rows.length}):`, ...(shown.length ? shown : ['(none)']));
+      if (rows.length > CAP) lines.push(`  …and ${rows.length - CAP} more`);
     };
 
     if (want.has('comments')) {
-      const data = await api(`/api/comments?taskId=${enc(t.taskId)}&limit=50`);
-      const comments = data?.comments ?? (Array.isArray(data) ? data : []);
-      section('Comments', comments.flatMap((c) => [
+      const list = comments?.comments ?? (Array.isArray(comments) ? comments : []);
+      section('Comments', list.flatMap((c) => [
         // The id is what edit_teamboard_comment / delete_teamboard_comment need.
-        `- [${c._id}] ${displayName(c.author) || 'Unknown'} (${formatDate(c.createdAt)}): ${stripHtml(c.content || '')}`,
-        ...(c.replies ?? []).map((r) => `    ↳ [${r._id}] ${displayName(r.author) || 'Unknown'}: ${stripHtml(r.content || '')}`),
+        `- [${c._id}] ${displayName(c.author) || 'Unknown'} (${formatDate(c.createdAt)}): ${stripHtml(c.content || '')}`
+          + attachmentNote(c) + reactionNote(c),
+        ...(c.replies ?? []).map((r) =>
+          `    ↳ [${r._id}] ${displayName(r.author) || 'Unknown'}: ${stripHtml(r.content || '')}`
+          + attachmentNote(r) + reactionNote(r)),
       ]));
     }
 
     if (want.has('subtasks')) {
-      const subtasks = await api(`/api/tasks/${enc(t.taskId)}/subtasks`);
       section('Subtasks', (subtasks ?? []).map((st) =>
         `- ${st.taskId} — ${st.title} [${st.status}]${st.assignee?.name ? ` → ${st.assignee.name}` : ''} ${st.progress ?? 0}%`));
     }
 
     if (want.has('links')) {
-      const links = await api(`/api/tasks/${enc(t.taskId)}/links`);
       section('Linked tasks', (links ?? []).map((l) =>
         `- ${l.linkType.replace(/_/g, ' ')}: ${l.task?.taskId} — ${l.task?.title} [${l.task?.status}]`));
     }
@@ -245,7 +280,6 @@ tool(
     }
 
     if (want.has('history')) {
-      const activities = await api(`/api/tasks/${enc(t.taskId)}/activities?limit=30`);
       section('History', (activities ?? []).map((a) => {
         const change = a.meta?.field
           ? ` (${a.meta.field}: ${historyValue(a.meta.oldValue)} → ${historyValue(a.meta.newValue)})`
@@ -255,8 +289,7 @@ tool(
     }
 
     if (want.has('time')) {
-      const data = await api(`/api/tasks/${enc(t.taskId)}/time-logs`);
-      const logs = data?.logs ?? (Array.isArray(data) ? data : []);
+      const logs = timeLogs?.logs ?? (Array.isArray(timeLogs) ? timeLogs : []);
       section('Time logs', logs.map((l) =>
         `- ${formatDuration(l.duration)} ${displayName(l.user) || ''} ${formatDate(l.startTime)}`
         + `${l.isManual ? ' (manual)' : ''}${l.approvalStatus && l.approvalStatus !== 'approved' ? ` [${l.approvalStatus}]` : ''}`
@@ -322,8 +355,6 @@ tool(
       'Create a task in TeamBoard.',
       'FIRST call search_teamboard_tasks to check for duplicates; if found, confirm with the user.',
       'Ask the user for: title, project, type and priority.',
-      `Types: ${typesText}.`,
-      `Priorities: ${prioritiesText}.`,
     ].join(' '),
     inputSchema: {
       title: z.string(),
@@ -373,7 +404,6 @@ tool(
     description: [
       'Update any field of an existing task. Identify the task by ID (TASK-42) or by title.',
       'People and projects are given by name — no IDs needed.',
-      `Statuses: ${statusesText}. Priorities: ${prioritiesText}. Types: ${typesText}.`,
       'Pass "none" to assignee/project/parent/type to clear it.',
     ].join(' '),
     inputSchema: {
@@ -383,19 +413,19 @@ tool(
       status: z.string().optional().describe(`One of: ${statusesText}`),
       priority: z.string().optional().describe(`One of: ${prioritiesText}`),
       type: z.string().optional().describe(`One of: ${typesText}, or "none"`),
-      assignee: z.string().optional().describe('Person\'s name or email, or "none" to unassign. Must be a project member.'),
-      reporters: z.array(z.string()).optional().describe('Replaces the reporter list (names or emails)'),
+      assignee: z.string().optional().describe('Name or email, or "none" to unassign. Must be a project member.'),
+      reporters: z.array(z.string()).optional().describe('Replaces the reporter list (names/emails)'),
       startDate: z.string().optional().describe('YYYY-MM-DD or ISO datetime'),
       dueDate: z.string().optional().describe("YYYY-MM-DD or ISO datetime (the task's Due Date)"),
       progress: z.number().int().min(0).max(100).optional(),
       tags: z.array(z.string()).optional().describe('REPLACES all tags on the task'),
-      project: z.string().optional().describe('Move to this project (code or name), or "none" to detach. Changes the task ID.'),
+      project: z.string().optional().describe('Move to this project (code or name), or "none". Changes the task ID.'),
       parent: z.string().optional().describe('Parent task ID or title, or "none" to unlink'),
       addWatcher: z.string().optional().describe('Person to start watching the task'),
       removeWatcher: z.string().optional().describe('Person to stop watching the task'),
-      clarification: z.string().optional().describe('Required (10+ chars, 2+ words) when moving an active task to In Progress or changing its due date'),
+      clarification: z.string().optional().describe('Why — required (10+ chars, 2+ words) when an active task changes due date or moves to in-progress'),
       trackerDecision: z.enum(['foreground', 'background', 'foreground_demote', 'foreground_stop']).optional()
-        .describe('Only if the server reports the assignee already has a running timer'),
+        .describe('Only if the server says the assignee already has a timer running'),
     },
   },
   async (args) => {
@@ -462,10 +492,26 @@ tool(
       comment: z.string().describe(`The comment body. ${HTML_NOTE}`),
       replyTo: z.string().optional()
         .describe('Comment id to reply to — makes this a threaded reply instead of a new top-level comment. Ids come from get_teamboard_task include: ["comments"].'),
+      files: z.array(z.string()).optional().describe('Absolute paths of local files to attach to the comment'),
     },
   },
   async (args) => {
     const t = await resolveTask(args.task);
+
+    if (args.files?.length) {
+      // With attachments the endpoint takes multipart instead of JSON.
+      const form = new FormData();
+      form.append('taskId', t.taskId);
+      form.append('content', args.comment);
+      if (args.replyTo) form.append('parentId', args.replyTo);
+      for (const filePath of args.files) {
+        const name = basename(filePath);
+        form.append('attachments', new Blob([await readFile(filePath)], { type: mimeFor(name) }), name);
+      }
+      await api('/api/comments', { method: 'POST', body: form });
+      return text(`${args.replyTo ? 'Replied' : 'Commented'} on ${t.taskId} with ${args.files.length} file(s).\n${taskUrl(t.taskId)}`);
+    }
+
     await api('/api/comments', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -488,7 +534,7 @@ tool(
   {
     name: 'create_teamboard_subtask',
     title: 'Create a TeamBoard subtask',
-    description: `Add a subtask under an existing task. It inherits the parent's project. Types: ${typesText}. Priorities: ${prioritiesText}.`,
+    description: "Add a subtask under an existing task. It inherits the parent's project.",
     inputSchema: {
       parent: TASK_REF,
       title: z.string(),
@@ -526,7 +572,7 @@ tool(
   {
     name: 'link_teamboard_tasks',
     title: 'Link two TeamBoard tasks',
-    description: `Create a typed relationship between two tasks. The inverse link is implied — linking A blocks B means B is blocked_by A. Types: ${LINK_TYPES.join(', ')}.`,
+    description: 'Create a typed relationship between two tasks. The inverse is implied — linking A blocks B means B is blocked_by A.',
     inputSchema: {
       task: TASK_REF,
       target: z.string().describe('The other task — ID or title'),
@@ -706,7 +752,7 @@ tool(
   {
     name: 'start_teamboard_timer',
     title: 'Start the timer on a TeamBoard task',
-    description: 'Start tracking time. You can only run one foreground timer at a time — starting another pauses it. Note that moving a task INTO an in-progress status starts its timer automatically, so this is for tracking without a status change.',
+    description: 'Start tracking time. One foreground timer at a time — starting another pauses it. Moving a task into an in-progress status already starts its timer, so use this only to track without a status change.',
     inputSchema: {
       task: TASK_REF,
       mode: z.enum(['foreground', 'background']).optional()
@@ -890,6 +936,88 @@ tool(
     const t = await resolveTask(args.task);
     await api(`/api/tasks/${enc(t.taskId)}`, { method: 'DELETE' });
     return text(`Deleted ${t.taskId} — ${t.title}.`);
+  }
+);
+
+tool(
+  {
+    name: 'my_teamboard_notifications',
+    title: 'My TeamBoard notifications',
+    description: 'Your inbox — mentions, assignments, comments, due-date reminders and team digests. Ids are printed so they can be marked read.',
+    inputSchema: {
+      unreadOnly: z.boolean().optional().describe('Only what you have not read yet'),
+      limit: z.number().int().min(1).max(50).optional().describe('Default 20'),
+    },
+  },
+  async (args) => {
+    const data = await api(`/api/notifications?page=1&limit=${args.limit ?? 20}`);
+    const all = data?.items ?? [];
+    const items = args.unreadOnly ? all.filter((n) => !n.read) : all;
+
+    if (!items.length) return text(args.unreadOnly ? 'Nothing unread.' : 'No notifications.');
+
+    // A digest can carry a dozen children, each of whose messages already names its
+    // task — so prefixing the key and the actor printed the same context three times
+    // and buried everything else. Print the sentence, cap the length, cap the count.
+    const KIDS = 4;
+    const lines = items.map((n) => {
+      const who = n.actorName || displayName(n.actor) || '';
+      const where = n.taskHumanId && !String(n.message ?? '').includes(n.taskHumanId) ? ` on ${n.taskHumanId}` : '';
+      const kids = (n.children ?? []).slice(0, KIDS).map((c) => {
+        const msg = oneLine(c.message, 110);
+        const key = c.taskHumanId && !msg.includes(c.taskHumanId) ? `${c.taskHumanId} ` : '';
+        return `    ↳ ${key}${msg}`;
+      });
+      if ((n.children ?? []).length > KIDS) kids.push(`    ↳ …and ${n.children.length - KIDS} more`);
+      return [
+        `- ${n.read ? '  ' : '● '}[${n._id}] ${who ? `${who} ` : ''}${oneLine(n.message, 140)}${where} (${formatDate(n.createdAt)})`,
+        ...kids,
+      ].join('\n');
+    });
+    return text(`${data.unreadCount ?? 0} unread of ${data.total ?? items.length}:\n${lines.join('\n')}`);
+  }
+);
+
+tool(
+  {
+    name: 'read_teamboard_notifications',
+    title: 'Mark notifications read',
+    description: 'Mark one notification read by id, or all of them at once.',
+    inputSchema: {
+      notificationId: z.string().optional().describe('The id from my_teamboard_notifications; omit to mark everything read'),
+    },
+  },
+  async (args) => {
+    if (args.notificationId) {
+      await api(`/api/notifications/${enc(args.notificationId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ read: true }),
+      });
+      return text('Marked read.');
+    }
+    await api('/api/notifications', { method: 'PATCH' });
+    return text('All notifications marked read.');
+  }
+);
+
+tool(
+  {
+    name: 'react_to_teamboard_comment',
+    title: 'React to a comment',
+    description: 'Toggle an emoji reaction on a comment — reacting again with the same emoji removes it. Ids come from get_teamboard_task include: ["comments"].',
+    inputSchema: {
+      commentId: z.string().describe('The comment id shown in square brackets'),
+      emoji: z.string().describe('A single emoji, e.g. 👍 🎉 ✅'),
+    },
+  },
+  async (args) => {
+    await api(`/api/comments/${enc(args.commentId)}/reactions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ emoji: args.emoji }),
+    });
+    return text(`Toggled ${args.emoji} on that comment.`);
   }
 );
 

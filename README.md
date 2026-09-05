@@ -38,6 +38,7 @@ what you want it to do:
 | `users:read` | people lookup, `assignee: "me"`, people in global search |
 | `tags:read` | the tag vocabulary |
 | `time:read` `time:write` | time logs, timers, manual entries |
+| `notifications:read` `notifications:write` | read your inbox, mark items read |
 MCP servers only pick up env changes on restart — run `/mcp` to reconnect after
 changing the token.
 
@@ -52,7 +53,10 @@ changing the token.
 | `edit_teamboard_task` | Update title, description, status, priority, type, assignee, reporters, dates, progress, tags, project, parent task, watchers. |
 | `create_teamboard_subtask` | Add a subtask under a task; inherits the parent's project. |
 | `link_teamboard_tasks` / `unlink_teamboard_tasks` | Typed relationships: blocks, blocked_by, clones, cloned_by, splits_into, splits_from, causes, caused_by, duplicate_of, relates_to. The inverse is implied. |
-| `comment_teamboard_task` | Post a comment (HTML), or a threaded reply with `replyTo`. |
+| `comment_teamboard_task` | Post a comment (HTML), a threaded reply with `replyTo`, and/or attach local `files`. |
+| `react_to_teamboard_comment` | Toggle an emoji reaction on a comment. |
+| `my_teamboard_notifications` | Your inbox — mentions, assignments, due reminders, team digests. |
+| `read_teamboard_notifications` | Mark one read, or all. |
 | `edit_teamboard_comment` / `delete_teamboard_comment` | Change or remove a comment by id — your own, or any as an admin. |
 | `add_teamboard_attachment` | Upload a local file onto a task. |
 | `download_teamboard_attachment` | Save an attachment to a local file. |
@@ -93,6 +97,20 @@ TEAMBOARD_BASE_URL=http://localhost:3000 TEAMBOARD_TOKEN=tbp_xxx node index.js
 
 `resolve.js` holds the API client and the reference resolvers; `index.js` is only
 tool definitions and formatting.
+
+### Performance notes
+
+- **Sections load in parallel.** `get_teamboard_task` with a full `include` issues its
+  five sub-requests together rather than one after another.
+- **Resolutions are cached for 60s.** The same project code or person's name costs one
+  round trip per minute, not one per tool call. The TTL is deliberately short: a stale
+  hit here would address the *wrong* row. `invalidateCache()` clears it.
+- **Every request has a 30s timeout**, and an unreachable server fails with the base
+  URL in the message instead of hanging the tool call.
+- **Long lists are capped** (25 rows per section, 4 children per digest notification)
+  with an "…and N more" line, so one busy task cannot bury the rest of a reply.
+- **Tool schemas cost ~5.4k tokens** for 28 tools. The workspace vocabulary is listed
+  once per tool, on the field that needs it, not repeated in the description.
 
 Attachments are addressed by **name**, never by their storage URL, and an ambiguous
 name lists the candidates rather than picking one — deleting the wrong file is not

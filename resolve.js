@@ -13,9 +13,21 @@ export class ApiError extends Error {
 
 export const enc = encodeURIComponent;
 
+// No timeout by default means a stalled server hangs the tool call for ever, with
+// nothing for the caller to act on. 30s is far above any real response here.
+const TIMEOUT_MS = 30_000;
+
 export async function api(path, init = {}) {
   const headers = { Authorization: `Bearer ${process.env.TEAMBOARD_TOKEN}`, ...init.headers };
-  const res = await fetch(`${BASE_URL}${path}`, { ...init, headers });
+  let res;
+  try {
+    res = await fetch(`${BASE_URL}${path}`, { ...init, headers, signal: AbortSignal.timeout(TIMEOUT_MS) });
+  } catch (err) {
+    if (err?.name === 'TimeoutError') {
+      throw new ApiError(`${init.method || 'GET'} ${path} timed out after ${TIMEOUT_MS / 1000}s.`, 504);
+    }
+    throw new ApiError(`Cannot reach TeamBoard at ${BASE_URL} — ${err?.message ?? err}`, 503);
+  }
   const json = await res.json().catch(() => ({}));
   if (!res.ok || json.success === false) {
     throw new ApiError(json.message || `${init.method || 'GET'} ${path} failed (${res.status})`, res.status);
@@ -35,6 +47,7 @@ export async function apiRaw(path) {
   const res = await fetch(`${BASE_URL}${path}`, {
     headers: { Authorization: `Bearer ${process.env.TEAMBOARD_TOKEN}` },
     redirect: 'manual',
+    signal: AbortSignal.timeout(TIMEOUT_MS),
   });
   if (res.status >= 300 && res.status < 400) {
     throw new ApiError(
@@ -55,6 +68,26 @@ export const attachmentPath = (url) => {
   const clean = url.startsWith('/') ? url : `/${url}`;
   return clean.startsWith('/api/') ? clean : `/api/uploads${clean}`;
 };
+
+// The server is long-lived, and a conversation resolves the same project code or
+// person's name repeatedly — each costing a round trip. Short TTL because names and
+// rosters do change, and a stale hit here would address the WRONG row.
+const CACHE_TTL_MS = 60_000;
+const cache = new Map();
+
+export async function cached(key, load) {
+  const hit = cache.get(key);
+  if (hit && hit.at > Date.now() - CACHE_TTL_MS) return hit.value;
+  const value = await load();
+  cache.set(key, { value, at: Date.now() });
+  if (cache.size > 200) {
+    for (const [k, v] of cache) if (v.at <= Date.now() - CACHE_TTL_MS) cache.delete(k);
+  }
+  return value;
+}
+
+/** Drop cached lookups — call after anything that renames or re-roles what they key on. */
+export const invalidateCache = () => cache.clear();
 
 export const isObjectId = (s) => /^[a-f\d]{24}$/i.test(s);
 export const looksLikeTaskId = (s) => /^[A-Za-z][A-Za-z0-9]*-\d+$/.test(String(s).trim());
@@ -101,6 +134,10 @@ export async function resolveTask(ref) {
 // Returns a user _id. `projectId` scopes the lookup to that project's roster,
 // which is what task assignment actually requires.
 export async function resolveUser(ref, projectId) {
+  return cached(`user:${projectId ?? ''}:${String(ref).trim().toLowerCase()}`, () => resolveUserUncached(ref, projectId));
+}
+
+async function resolveUserUncached(ref, projectId) {
   const r = String(ref).trim();
   if (isObjectId(r)) return r;
 
@@ -136,6 +173,10 @@ export async function resolveUser(ref, projectId) {
 }
 
 export async function resolveProject(ref) {
+  return cached(`project:${String(ref).trim().toLowerCase()}`, () => resolveProjectUncached(ref));
+}
+
+async function resolveProjectUncached(ref) {
   const r = String(ref).trim();
   const query = isObjectId(r) ? `ids=${enc(r)}` : `search=${enc(r)}&limit=20`;
   const { projects = [] } = await api(`/api/projects?${query}`);

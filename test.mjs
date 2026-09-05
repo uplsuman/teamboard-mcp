@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict';
 import {
   attachmentPath, formatDate, isClear, isObjectId, looksLikeTaskId, normalizeValue,
-  pickOne, resolveProject, resolveTask, resolveUser,
+  invalidateCache, pickOne, resolveProject, resolveTask, resolveUser,
 } from './resolve.js';
 
 process.env.TEAMBOARD_TOKEN = 'tbp_test';
@@ -110,6 +110,24 @@ await rejects(() => resolveUser('Outsider', 'p1'), /doesn't match exactly one me
 stub({});
 assert.equal(await resolveUser('507f1f77bcf86cd799439011'), '507f1f77bcf86cd799439011');
 assert.deepEqual(calls, []);
+
+// ── the resolution cache ─────────────────────────────────────────────────────
+// A conversation resolves the same person over and over; each miss is a round trip.
+stub({ '/api/users?search=': { users: [{ _id: 'u9', name: 'Cache Probe', email: 'c@x.com' }] } });
+assert.equal(await resolveUser('Cache Probe'), 'u9');
+assert.equal(calls.length, 1);
+assert.equal(await resolveUser('Cache Probe'), 'u9');
+assert.equal(calls.length, 1, 'second lookup must not hit the network');
+assert.equal(await resolveUser('CACHE PROBE'), 'u9'); // key is case-insensitive
+assert.equal(calls.length, 1);
+invalidateCache();
+assert.equal(await resolveUser('Cache Probe'), 'u9');
+assert.equal(calls.length, 2, 'invalidateCache must force a refetch');
+
+// Scoping matters: the same name inside a project is a DIFFERENT question.
+stub({ '/api/projects/p9/members': { members: [{ role: 'member', user: { _id: 'u10', name: 'Cache Probe', email: 'c@x.com' } }] } });
+assert.equal(await resolveUser('Cache Probe', 'p9'), 'u10');
+invalidateCache();
 
 // ── resolveProject ───────────────────────────────────────────────────────────
 stub({ '/api/projects?search=': { projects: [
