@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { readFile, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import {
-  api, apiRaw, attachmentPath, enc, fetchVocab, isClear, normalizeValue,
+  api, apiRaw, attachmentPath, enc, fetchVocab, isClear, normalizeValue, pickOne,
   resolveProject, resolveTask, resolveUser,
   displayName, formatDate, stripHtml, taskUrl,
 } from './resolve.js';
@@ -50,10 +50,34 @@ const MIME_BY_EXT = {
 };
 const mimeFor = (name) => MIME_BY_EXT[name.split('.').pop()?.toLowerCase()] || 'application/octet-stream';
 
+// Durations come back in seconds.
+const formatDuration = (secs) => {
+  const total = Math.round((secs ?? 0) / 60);
+  const h = Math.floor(total / 60);
+  const m = total % 60;
+  return h ? `${h}h ${m}m` : `${m}m`;
+};
+
 function historyValue(value) {
   if (value === null || value === undefined || value === '') return '—';
   const flat = typeof value === 'object' ? JSON.stringify(value) : stripHtml(String(value));
   return flat.length > 80 ? `${flat.slice(0, 79)}…` : flat;
+}
+
+// Saved filters are addressed by name; the API maps _id → id in its responses.
+async function listFilters() {
+  const data = await api('/api/saved-filters');
+  return data?.filters ?? (Array.isArray(data) ? data : []);
+}
+
+async function resolveFilter(name) {
+  const rows = await listFilters();
+  const hit = pickOne(rows, name, ['name']);
+  if (!hit) {
+    throw new Error(`No single saved filter matches "${name}".`
+      + (rows.length ? `\nYours:\n${rows.map((f) => `- ${f.name}`).join('\n')}` : ''));
+  }
+  return hit;
 }
 
 // Attachments are addressed by name, not by the storage url the caller cannot know.
@@ -97,6 +121,8 @@ tool(
       type: z.array(z.string()).optional().describe(`Any of: ${typesText}`),
       dueBefore: z.string().optional().describe('Only tasks due on or before this date (YYYY-MM-DD)'),
       dueAfter: z.string().optional().describe('Only tasks due on or after this date (YYYY-MM-DD)'),
+      savedFilter: z.string().optional()
+        .describe('Run a saved filter by name (list them with list_teamboard_filters). Its JQL is used unless `jql` is also given.'),
       jql: z.string().optional().describe(
         'Raw TeamBoard JQL for anything the filters above cannot express, e.g. '
         + 'status IN ("To Do", "In Progress") AND priority = High ORDER BY due ASC. '
@@ -115,7 +141,15 @@ tool(
     };
 
     if (args.query) params.set('search', args.query);
-    if (args.jql) params.set('jql', args.jql);
+
+    // An explicit jql wins, so "run my filter but only High priority" stays possible
+    // by combining savedFilter with the plain filters below.
+    const savedJql = args.savedFilter ? (await resolveFilter(args.savedFilter)).filters?.jql : undefined;
+    const jql = args.jql ?? savedJql;
+    if (args.savedFilter && !savedJql && !args.jql) {
+      throw new Error(`Saved filter "${args.savedFilter}" has no JQL stored — it was built with the visual filter UI.`);
+    }
+    if (jql) params.set('jql', jql);
     addList('status', args.status, vocab.statuses, 'status');
     addList('priority', args.priority, vocab.priorities, 'priority');
     addList('taskType', args.type, vocab.taskTypes, 'task type');
@@ -152,7 +186,7 @@ tool(
     ].join(' '),
     inputSchema: {
       task: TASK_REF,
-      include: z.array(z.enum(['comments', 'subtasks', 'links', 'attachments', 'history']))
+      include: z.array(z.enum(['comments', 'subtasks', 'links', 'attachments', 'history', 'time']))
         .optional().describe('Extra sections to load'),
     },
   },
@@ -218,6 +252,15 @@ tool(
           : '';
         return `- ${formatDate(a.createdAt)} ${displayName(a.actor) || 'Someone'}: ${a.message}${change}`;
       }));
+    }
+
+    if (want.has('time')) {
+      const data = await api(`/api/tasks/${enc(t.taskId)}/time-logs`);
+      const logs = data?.logs ?? (Array.isArray(data) ? data : []);
+      section('Time logs', logs.map((l) =>
+        `- ${formatDuration(l.duration)} ${displayName(l.user) || ''} ${formatDate(l.startTime)}`
+        + `${l.isManual ? ' (manual)' : ''}${l.approvalStatus && l.approvalStatus !== 'approved' ? ` [${l.approvalStatus}]` : ''}`
+        + `${l.description ? ` — ${stripHtml(l.description)}` : ''}`));
     }
 
     lines.push('', taskUrl(t.taskId));
@@ -417,6 +460,8 @@ tool(
     inputSchema: {
       task: TASK_REF,
       comment: z.string().describe(`The comment body. ${HTML_NOTE}`),
+      replyTo: z.string().optional()
+        .describe('Comment id to reply to — makes this a threaded reply instead of a new top-level comment. Ids come from get_teamboard_task include: ["comments"].'),
     },
   },
   async (args) => {
@@ -424,9 +469,13 @@ tool(
     await api('/api/comments', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ taskId: t.taskId, content: args.comment }),
+      body: JSON.stringify({
+        taskId: t.taskId,
+        content: args.comment,
+        ...(args.replyTo ? { parentId: args.replyTo } : {}),
+      }),
     });
-    return text(`Commented on ${t.taskId}.\n${taskUrl(t.taskId)}`);
+    return text(`${args.replyTo ? 'Replied' : 'Commented'} on ${t.taskId}.\n${taskUrl(t.taskId)}`);
   }
 );
 
@@ -618,6 +667,229 @@ tool(
     await api(`/api/tasks/${enc(t.taskId)}`, { method: 'PATCH', body: form });
 
     return text(`Removed ${doc.name} from ${t.taskId}.`);
+  }
+);
+
+tool(
+  {
+    name: 'log_teamboard_time',
+    title: 'Log time on a TeamBoard task',
+    description: 'Record work already done. Manual entries start as PENDING approval — only approved time counts toward a task total. Minimum one minute.',
+    inputSchema: {
+      task: TASK_REF,
+      minutes: z.number().int().min(1).describe('How long the work took, in minutes'),
+      description: z.string().optional().describe('What was done'),
+      startedAt: z.string().optional().describe('When the work started (ISO datetime; defaults to now)'),
+    },
+  },
+  async (args) => {
+    const t = await resolveTask(args.task);
+    const startTime = args.startedAt ? new Date(args.startedAt) : new Date();
+    const endTime = new Date(startTime.getTime() + args.minutes * 60_000);
+
+    await api(`/api/tasks/${enc(t.taskId)}/time-logs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // The API takes SECONDS.
+      body: JSON.stringify({
+        duration: args.minutes * 60,
+        description: args.description ?? '',
+        startTime: startTime.toISOString(),
+        endTime: endTime.toISOString(),
+      }),
+    });
+    return text(`Logged ${formatDuration(args.minutes * 60)} on ${t.taskId} (pending approval).\n${taskUrl(t.taskId)}`);
+  }
+);
+
+tool(
+  {
+    name: 'start_teamboard_timer',
+    title: 'Start the timer on a TeamBoard task',
+    description: 'Start tracking time. You can only run one foreground timer at a time — starting another pauses it. Note that moving a task INTO an in-progress status starts its timer automatically, so this is for tracking without a status change.',
+    inputSchema: {
+      task: TASK_REF,
+      mode: z.enum(['foreground', 'background']).optional()
+        .describe('background runs alongside your foreground timer (default foreground)'),
+      trackerDecision: z.enum(['foreground', 'background', 'foreground_demote', 'foreground_stop']).optional()
+        .describe('Only if the server reports you already have a timer running'),
+    },
+  },
+  async (args) => {
+    const t = await resolveTask(args.task);
+    await api(`/api/tasks/${enc(t.taskId)}/time-logs/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...(args.mode ? { mode: args.mode } : {}),
+        ...(args.trackerDecision ? { trackerDecision: args.trackerDecision } : {}),
+      }),
+    });
+    return text(`Timer running on ${t.taskId}.\n${taskUrl(t.taskId)}`);
+  }
+);
+
+tool(
+  {
+    name: 'stop_teamboard_timer',
+    title: 'Stop the timer on a TeamBoard task',
+    description: 'Pause tracking and bank the elapsed time. Segments under a minute are discarded.',
+    inputSchema: { task: TASK_REF },
+  },
+  async (args) => {
+    const t = await resolveTask(args.task);
+    await api(`/api/tasks/${enc(t.taskId)}/time-logs/pause`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    return text(`Timer stopped on ${t.taskId}.\n${taskUrl(t.taskId)}`);
+  }
+);
+
+tool(
+  {
+    name: 'my_teamboard_timers',
+    title: 'What am I tracking right now',
+    description: 'List your running timers — foreground, background and project-level.',
+    inputSchema: {},
+  },
+  async () => {
+    const data = await api('/api/trackers');
+    const rows = [
+      ...(data?.foreground ? [{ ...data.foreground, kind: 'foreground' }] : []),
+      ...(data?.background ?? []).map((r) => ({ ...r, kind: 'background' })),
+      ...(data?.projects ?? []).map((r) => ({ ...r, kind: 'project' })),
+    ];
+    if (!rows.length) return text('Nothing is being tracked right now.');
+    // A tracker row nests its subject: { task: {taskId, title} } or { project: {...} }.
+    return text(rows.map((r) => {
+      const what = r.task?.taskId
+        ? `${r.task.taskId} — ${r.task.title}`
+        : r.project
+          ? `${r.project.projectCode} — ${r.project.title} (project)`
+          : '(no subject)';
+      return `- [${r.kind}] ${what} — ${formatDuration(r.elapsedSecs)} so far, since ${formatDate(r.startTime)}`;
+    }).join('\n'));
+  }
+);
+
+tool(
+  {
+    name: 'list_teamboard_tags',
+    title: 'List TeamBoard tags',
+    description: 'The tag vocabulary in use across the workspace. Tag names are case-sensitive — reuse one from here rather than inventing a variant.',
+    inputSchema: {},
+  },
+  async () => {
+    const tags = await api('/api/tasks/tags');
+    const names = (Array.isArray(tags) ? tags : tags?.tags ?? []).map((t) => t.name ?? t).filter(Boolean);
+    if (!names.length) return text('No tags yet.');
+    return text(`${names.length} tag(s):\n${names.map((n) => `- ${n}`).join('\n')}`);
+  }
+);
+
+tool(
+  {
+    name: 'search_teamboard',
+    title: 'Search all of TeamBoard',
+    description: 'One query across tasks, projects, people, departments and saved filters. Use search_teamboard_tasks when you only want tasks and want to filter them.',
+    inputSchema: { query: z.string().describe('What to look for') },
+  },
+  async (args) => {
+    const d = await api(`/api/search?q=${enc(args.query)}`);
+    const blocks = [
+      ['Tasks', (d?.tasks ?? []).map((t) =>
+        `- ${t.taskId} — ${t.title}${t.status ? ` [${t.status}]` : ''}${t.project?.title ? ` (${t.project.title})` : ''}`)],
+      // Global search returns `code`, not `projectCode` like /api/projects does.
+      ['Projects', (d?.projects ?? []).map((p) => `- ${p.code ? `${p.code} — ` : ''}${p.title}`)],
+      ['People', (d?.people ?? []).map((u) => `- ${u.name}${u.email ? ` <${u.email}>` : ''}`)],
+      ['Departments', (d?.departments ?? []).map((x) => `- ${x.name}`)],
+      ['Saved filters', (d?.filters ?? []).map((f) => `- ${f.name}`)],
+    ].filter(([, rows]) => rows.length);
+
+    if (!blocks.length) return text(`Nothing matched "${args.query}".`);
+    return text(blocks.map(([label, rows]) => `${label}:\n${rows.join('\n')}`).join('\n\n'));
+  }
+);
+
+tool(
+  {
+    name: 'list_teamboard_filters',
+    title: 'List saved filters',
+    description: 'Your saved task filters and any shared with you. Run one with search_teamboard_tasks { savedFilter: "<name>" }.',
+    inputSchema: {},
+  },
+  async () => {
+    const rows = await listFilters();
+    if (!rows.length) return text('No saved filters.');
+    return text(rows.map((f) =>
+      `- ${f.name}${f.description ? ` — ${f.description}` : ''}${f.filters?.jql ? `\n  ${f.filters.jql}` : ''}`
+    ).join('\n'));
+  }
+);
+
+tool(
+  {
+    name: 'save_teamboard_filter',
+    title: 'Save a filter',
+    description: 'Store a JQL query under a name so it can be run again. Saving over an existing name replaces its query.',
+    inputSchema: {
+      name: z.string().describe('What to call it'),
+      jql: z.string().describe('The JQL this filter runs, e.g. assignee = currentUser() AND status = "In Progress"'),
+      description: z.string().optional(),
+    },
+  },
+  async (args) => {
+    const existing = (await listFilters()).find((f) => f.name?.toLowerCase() === args.name.trim().toLowerCase());
+    const payload = {
+      name: args.name,
+      ...(args.description ? { description: args.description } : {}),
+      filters: { jql: args.jql },
+    };
+
+    if (existing) {
+      await api(`/api/saved-filters/${enc(existing.id ?? existing._id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      return text(`Updated saved filter "${args.name}".`);
+    }
+    await api('/api/saved-filters', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return text(`Saved filter "${args.name}".`);
+  }
+);
+
+tool(
+  {
+    name: 'delete_teamboard_filter',
+    title: 'Delete a saved filter',
+    description: 'Remove one of your saved filters by name.',
+    inputSchema: { name: z.string() },
+  },
+  async (args) => {
+    const hit = await resolveFilter(args.name);
+    await api(`/api/saved-filters/${enc(hit.id ?? hit._id)}`, { method: 'DELETE' });
+    return text(`Deleted saved filter "${hit.name}".`);
+  }
+);
+
+tool(
+  {
+    name: 'delete_teamboard_task',
+    title: 'Delete a TeamBoard task',
+    description: 'Permanently remove a task (admin only). This cannot be undone — confirm with the user first, and prefer setting the status to Cancelled or Closed.',
+    inputSchema: { task: TASK_REF },
+  },
+  async (args) => {
+    const t = await resolveTask(args.task);
+    await api(`/api/tasks/${enc(t.taskId)}`, { method: 'DELETE' });
+    return text(`Deleted ${t.taskId} — ${t.title}.`);
   }
 );
 

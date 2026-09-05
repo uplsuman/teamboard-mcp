@@ -133,6 +133,21 @@ assert.deepEqual(calls, ['GET /api/users/me']);
 stub({ '/api/tasks/TASK-7': { __status: 400, __message: 'Assignee must be a member of the project' } });
 await rejects(() => resolveTask('TASK-7'), /Assignee must be a member of the project/);
 
+// ── formatDuration (mirrors index.js — time comes back in SECONDS) ───────────
+const formatDuration = (secs) => {
+  const total = Math.round((secs ?? 0) / 60);
+  const h = Math.floor(total / 60);
+  const m = total % 60;
+  return h ? `${h}h ${m}m` : `${m}m`;
+};
+assert.equal(formatDuration(3600), '1h 0m');
+assert.equal(formatDuration(5400), '1h 30m');
+assert.equal(formatDuration(90), '2m');      // rounds to the nearest minute
+assert.equal(formatDuration(0), '0m');
+assert.equal(formatDuration(undefined), '0m');
+// The API takes seconds; logging "30 minutes" must not send 30.
+assert.equal(30 * 60, 1800);
+
 // ── attachmentPath ───────────────────────────────────────────────────────────
 // A stored url is "/files/...", which next.config rewrites to the API route — but that
 // path is not under /api/*, so middleware 307s a token request to the login page, and
