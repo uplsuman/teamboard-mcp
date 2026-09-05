@@ -40,16 +40,55 @@ tool(
   {
     name: 'search_teamboard_tasks',
     title: 'Search TeamBoard tasks',
-    description: 'Search tasks by keyword across title, description, tags, comments, assignee and project. Call BEFORE creating to check for duplicates. Results include task IDs and URLs.',
+    description: [
+      'Find tasks. `query` searches title, description, tags, comments, assignee and project.',
+      'The filters combine (AND), so "my open bugs in TB" is assignee + status + type + project — no query needed.',
+      'Call BEFORE creating a task to check for duplicates. Results include task IDs and URLs.',
+      `Statuses: ${statusesText}. Priorities: ${prioritiesText}. Types: ${typesText}.`,
+    ].join(' '),
     inputSchema: {
-      query: z.string().describe('Keyword(s) to search for'),
+      query: z.string().optional().describe('Keyword(s) to search for'),
+      assignee: z.string().optional().describe('Person\'s name or email, or "me" for yourself'),
+      project: z.string().optional().describe('Project code or name'),
+      status: z.array(z.string()).optional().describe(`Any of: ${statusesText}`),
+      priority: z.array(z.string()).optional().describe(`Any of: ${prioritiesText}`),
+      type: z.array(z.string()).optional().describe(`Any of: ${typesText}`),
+      dueBefore: z.string().optional().describe('Only tasks due on or before this date (YYYY-MM-DD)'),
+      dueAfter: z.string().optional().describe('Only tasks due on or after this date (YYYY-MM-DD)'),
+      jql: z.string().optional().describe(
+        'Raw TeamBoard JQL for anything the filters above cannot express, e.g. '
+        + 'status IN ("To Do", "In Progress") AND priority = High ORDER BY due ASC. '
+        + 'Sortable fields are due, start, created, updated, priority, title, status, '
+        + 'assignee — NOT the camelCase column names. The server reports its own errors.'
+      ),
       limit: z.number().int().min(1).max(50).optional().describe('Max results (default 10)'),
     },
   },
   async (args) => {
-    const data = await api(`/api/tasks?search=${enc(args.query)}&limit=${args.limit ?? 10}`);
+    // Array filters go over the wire JSON-encoded — the route does JSON.parse on each.
+    const params = new URLSearchParams({ limit: String(args.limit ?? 10) });
+    const addList = (key, values, allowed, label) => {
+      if (!values?.length) return;
+      params.set(key, JSON.stringify(values.map((v) => normalizeValue(v, allowed, label))));
+    };
+
+    if (args.query) params.set('search', args.query);
+    if (args.jql) params.set('jql', args.jql);
+    addList('status', args.status, vocab.statuses, 'status');
+    addList('priority', args.priority, vocab.priorities, 'priority');
+    addList('taskType', args.type, vocab.taskTypes, 'task type');
+    if (args.assignee) params.set('assignedTo', JSON.stringify([await resolveUser(args.assignee)]));
+    if (args.project) params.set('projectId', String((await resolveProject(args.project))._id));
+    if (args.dueBefore) params.set('dueTo', args.dueBefore);
+    if (args.dueAfter) params.set('dueFrom', args.dueAfter);
+
+    if ([...params.keys()].length === 1) {
+      throw new Error('Give me something to search on — a query, a filter, or jql.');
+    }
+
+    const data = await api(`/api/tasks?${params.toString()}`);
     const tasks = data?.allTasks ?? [];
-    if (!tasks.length) return text(`No tasks found matching "${args.query}".`);
+    if (!tasks.length) return text('No tasks matched.');
     const lines = tasks.map((t) => {
       const proj = t.project?.title ? ` (${t.project.title})` : '';
       const who = t.assignee?.name ? ` → ${t.assignee.name}` : '';

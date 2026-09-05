@@ -124,6 +124,11 @@ stub({ '/api/projects?ids=': { projects: [{ _id: '507f1f77bcf86cd799439011', pro
 assert.equal((await resolveProject('507f1f77bcf86cd799439011')).projectCode, 'TB');
 assert.ok(calls[0].includes('ids='));
 
+// ── resolveUser("me") ────────────────────────────────────────────────────────
+stub({ '/api/users/me': { user: { _id: 'self-id', name: 'Me' } } });
+assert.equal(await resolveUser('me'), 'self-id');
+assert.deepEqual(calls, ['GET /api/users/me']);
+
 // ── server errors keep their message ─────────────────────────────────────────
 stub({ '/api/tasks/TASK-7': { __status: 400, __message: 'Assignee must be a member of the project' } });
 await rejects(() => resolveTask('TASK-7'), /Assignee must be a member of the project/);

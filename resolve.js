@@ -71,6 +71,14 @@ export async function resolveUser(ref, projectId) {
   const r = String(ref).trim();
   if (isObjectId(r)) return r;
 
+  // "me" is the token's own user — the caller cannot know their own id.
+  if (r.toLowerCase() === 'me') {
+    const data = await api('/api/users/me');
+    const id = data?.user?._id ?? data?._id;
+    if (!id) throw new Error('Could not resolve "me" — /api/users/me returned no user.');
+    return String(id);
+  }
+
   if (projectId) {
     const { members = [] } = await api(`/api/projects/${enc(projectId)}/members`);
     const roster = members.map((m) => ({ ...m.user, memberRole: m.role }));
