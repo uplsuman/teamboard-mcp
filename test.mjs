@@ -5,8 +5,8 @@
 // message listing the candidates. Never a silent wrong write.
 import assert from 'node:assert/strict';
 import {
-  attachmentPath, formatDate, isClear, isObjectId, looksLikeTaskId, normalizeValue,
-  invalidateCache, pickOne, resolveProject, resolveTask, resolveUser,
+  attachmentPath, fetchVocab, formatDate, isClear, isObjectId, looksLikeTaskId,
+  normalizeValue, invalidateCache, pickOne, resolveProject, resolveTask, resolveUser,
 } from './resolve.js';
 
 process.env.TEAMBOARD_TOKEN = 'tbp_test';
@@ -193,5 +193,22 @@ assert.equal(pick('spec-v1.pdf').url, '/files/documents/a.pdf'); // exact
 assert.equal(pick('screenshot').url, '/files/documents/c.png');  // lone partial
 assert.equal(pick('spec'), null);                                 // ambiguous → refuse
 assert.equal(pick('nothing'), null);
+
+// ── the workspace vocabulary ─────────────────────────────────────────────────
+// Resolutions ride along with the types and priorities. A task cannot be closed without
+// one, so losing them here would leave the tool descriptions unable to name a single
+// valid value.
+routes = {
+  '/api/tasks/meta': { taskTypes: ['Bug'], priorities: ['High'], resolutions: ['Fixed', 'As Designed'] },
+  '/api/tasks/statuses': [{ value: 'To Do' }, { value: 'Completed' }],
+};
+const vocab = await fetchVocab();
+assert.deepEqual(vocab.resolutions, ['Fixed', 'As Designed']);
+assert.deepEqual(vocab.statuses, ['To Do', 'Completed']);
+
+// An older server that does not serve them must degrade to empty, not undefined —
+// listOr() and normalizeValue() both branch on `.length`.
+routes = { '/api/tasks/meta': { taskTypes: [], priorities: [] }, '/api/tasks/statuses': [] };
+assert.deepEqual((await fetchVocab()).resolutions, []);
 
 console.log('all resolution checks passed');

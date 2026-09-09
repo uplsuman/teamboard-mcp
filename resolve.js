@@ -200,6 +200,11 @@ export async function fetchVocab() {
   return {
     taskTypes: meta?.taskTypes ?? [],
     priorities: meta?.priorities ?? [],
+    // The WORKSPACE list. A project may override it, and the server resolves that at
+    // enforcement time — sending a value the project does not have comes back as
+    // INVALID_RESOLUTION naming the ones it does, which is a better error than this
+    // client guessing per project on every call.
+    resolutions: meta?.resolutions ?? [],
     statuses: (Array.isArray(statuses) ? statuses : []).map((s) => s.value).filter(Boolean),
   };
 }

@@ -20,6 +20,14 @@ const listOr = (values, fallback) => (values.length ? values.join(', ') : fallba
 const typesText = listOr(vocab.taskTypes, 'Task, Bug, Feature, Story, Improvement, Epic');
 const prioritiesText = listOr(vocab.priorities, 'Blocker, Critical, Highest, High, Medium, Low, Minor');
 const statusesText = listOr(vocab.statuses, 'To Do, In Progress, Done, Closed');
+const resolutionsText = listOr(vocab.resolutions, 'Fixed, As Designed, Duplicate, Cannot Reproduce');
+
+// Two fields the server now DEMANDS, whose absence is a 400 rather than a default:
+// moving into a done status needs a resolution, and moving into an in-progress status
+// needs a tracker decision, because either one silently writes something a human should
+// have chosen (how the work ended, or whose clock starts).
+const RESOLUTION_NOTE = `Why the task ended. REQUIRED when the status moves to a done status (e.g. Completed, Cancelled, Closed) — the move is refused without it. One of: ${resolutionsText}`;
+const TRACKER_NOTE = 'REQUIRED when the status moves into an in-progress status, which would start the assignee\'s timer. Use "skip" to change the status without starting a timer, "foreground" to start it. The other values resolve a clash when the assignee is already tracking.';
 
 const text = (s) => ({ content: [{ type: 'text', text: s }] });
 
@@ -365,6 +373,7 @@ tool(
       assignee: z.string().optional().describe("Person's name or email — must be a member of the project"),
       reporters: z.array(z.string()).optional().describe('Reporter names or emails (defaults to you)'),
       status: z.string().optional().describe(`One of: ${statusesText}`),
+      resolution: z.string().optional().describe(`Only for filing a task that is ALREADY finished — required when \`status\` is a done status, ignored otherwise. One of: ${resolutionsText}`),
       startDate: z.string().optional().describe('YYYY-MM-DD or ISO datetime'),
       dueDate: z.string().optional().describe("YYYY-MM-DD or ISO datetime (the task's Due Date)"),
       tags: z.array(z.string()).optional().describe('Tag names (single words, case-sensitive)'),
@@ -378,6 +387,9 @@ tool(
       taskType: normalizeValue(args.type, vocab.taskTypes, 'task type'),
       priority: normalizeValue(args.priority, vocab.priorities, 'priority'),
       ...(args.status ? { status: normalizeValue(args.status, vocab.statuses, 'status') } : {}),
+      // Left unnormalised on purpose: the project's own list may differ from the
+      // workspace one, and only the server knows which applies.
+      ...(args.resolution ? { resolution: args.resolution } : {}),
       ...(args.description ? { description: args.description } : {}),
       ...(args.assignee ? { assigneeId: await resolveUser(args.assignee, String(project._id)) } : {}),
       ...(args.reporters?.length
@@ -405,6 +417,7 @@ tool(
       'Update any field of an existing task. Identify the task by ID (TASK-42) or by title.',
       'People and projects are given by name — no IDs needed.',
       'Pass "none" to assignee/project/parent/type to clear it.',
+      'Closing a task needs `resolution`; starting work on one needs `trackerDecision`.',
     ].join(' '),
     inputSchema: {
       task: TASK_REF,
@@ -424,8 +437,9 @@ tool(
       addWatcher: z.string().optional().describe('Person to start watching the task'),
       removeWatcher: z.string().optional().describe('Person to stop watching the task'),
       clarification: z.string().optional().describe('Why — required (10+ chars, 2+ words) when an active task changes due date or moves to in-progress'),
-      trackerDecision: z.enum(['foreground', 'background', 'foreground_demote', 'foreground_stop']).optional()
-        .describe('Only if the server says the assignee already has a timer running'),
+      resolution: z.string().optional().describe(RESOLUTION_NOTE),
+      trackerDecision: z.enum(['foreground', 'background', 'foreground_demote', 'foreground_stop', 'skip']).optional()
+        .describe(TRACKER_NOTE),
     },
   },
   async (args) => {
@@ -472,6 +486,9 @@ tool(
     if (args.addWatcher !== undefined) set('watcherAdd', await resolveUser(args.addWatcher), 'watchers');
     if (args.removeWatcher !== undefined) set('watcherRemove', await resolveUser(args.removeWatcher), 'watchers');
     if (args.clarification !== undefined) form.append('clarification', args.clarification);
+    // Not normalised against the workspace list: the project may override it, so the
+    // server is the only authority on what is valid here.
+    if (args.resolution !== undefined) form.append('resolution', args.resolution);
     if (args.trackerDecision !== undefined) form.append('trackerDecision', args.trackerDecision);
 
     if (!changed.length) throw new Error('Nothing to update — pass at least one field to change.');

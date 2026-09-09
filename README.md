@@ -79,12 +79,21 @@ Notes that bite:
   roster, so a non-member name fails with the roster rather than picking someone.
 - **`tags` replaces the whole list** — pass every tag you want to keep.
 - **`"none"`** clears `assignee`, `project`, `parent` or `type`.
-- **Statuses, priorities and task types are read from the workspace at startup**,
-  so the tool descriptions list your real values and a typo is rejected locally.
+- **Statuses, priorities, task types and resolutions are read from the workspace at
+  startup**, so the tool descriptions list your real values and a typo is rejected
+  locally. Resolutions are the one exception to local rejection: a project may override
+  the workspace list, so the value is sent as given and the server judges it.
 - Moving a task to another project **changes its task id**; the tool reports the new one.
-- Some server rules surface as tool errors and need a follow-up argument:
-  `clarification` (10+ chars) when an active task's due date or status changes, and
-  `trackerDecision` when the assignee already has a running timer.
+- **Two arguments are mandatory for the moves that need them, not optional extras:**
+  - `resolution` — moving a task into a **done** status (Completed, Cancelled, Closed…).
+    A status says where a task is; the resolution says how it ended, and the move is
+    refused without one.
+  - `trackerDecision` — moving a task into an **in-progress** status, which would start
+    the assignee's timer. Pass `skip` to change the status without starting a timer, or
+    `foreground` to start it. The other values resolve a clash when that person is
+    already tracking something.
+- Other server rules surface as tool errors and need a follow-up argument:
+  `clarification` (10+ chars) when an active task's due date or status changes.
 
 ## Development
 
