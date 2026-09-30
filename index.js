@@ -31,7 +31,35 @@ const TRACKER_NOTE = 'REQUIRED when the status moves into an in-progress status,
 
 const text = (s) => ({ content: [{ type: 'text', text: s }] });
 
-const server = new McpServer({ name: 'teamboard', version: '0.5.0' });
+// The team's standing rules for working tickets, sent to every client as server
+// instructions so an agent follows them without the user repeating them. Keep this in
+// step with the README's "Working rules" section.
+const INSTRUCTIONS = `Working rules for TeamBoard. Follow them without being asked.
+
+Writing tickets and comments
+- Write for a person, not a codebase: what the user sees, what was wrong, what happens now, how to check it. Leave function names and file paths to the PR.
+- description and comment are literal HTML (<h3>, <p>, <ul>/<li>, <strong>, <code>). Send the tags raw. Never HTML-escape them: &lt;p&gt; is stored and shown as text.
+- A task's endDate is labelled "Due Date".
+- No AI or tool attribution ("Generated with…", "Co-Authored-By") in ticket text.
+- Typing "@Name" notifies nobody. To bring someone in, add them with edit_teamboard_task { addWatcher }.
+
+Screenshots
+- Creating a ticket: attach a screenshot of the problem (add_teamboard_attachment right after create_teamboard_task) and mention it in the description.
+- After a fix: comment with a screenshot of the fixed behaviour (comment_teamboard_task { files }). The same screenshot goes in the PR description.
+
+Creating
+- Search first (search_teamboard_tasks) to catch duplicates.
+- Follow-up work related to an open ticket goes on that ticket as a comment or edit, not a new ticket.
+- Default type Task and priority Low without asking. Ask only for what you cannot infer (title, project).
+
+Working a ticket
+- Before writing code: move the ticket to an in-progress status with trackerDecision "foreground", which starts its timer. No ticket for the work? Ask, or create one.
+- If a foreground timer is already running (it may belong to another session), use "background". Never pause or stop the other timer. log_teamboard_time is only for time that was genuinely missed, not the normal way to record work.
+- Moving into in-progress needs a due date. Changing an active task's due date needs a clarification (10+ characters, 2+ words).
+- Entering a testing or done status needs a resolution.
+- PR raised: move the ticket to "PR In Review" and stop its timer with stop_teamboard_timer. The status change alone may not stop it.`;
+
+const server = new McpServer({ name: 'teamboard', version: '0.6.0' }, { instructions: INSTRUCTIONS });
 
 // Every handler funnels its errors into one MCP error result — the resolvers'
 // ambiguity messages ("matches 3 users: …") are the useful half of the output.
@@ -362,13 +390,14 @@ tool(
     description: [
       'Create a task in TeamBoard.',
       'FIRST call search_teamboard_tasks to check for duplicates; if found, confirm with the user.',
-      'Ask the user for: title, project, type and priority.',
+      'Type defaults to Task and priority to Low: do not ask for them.',
+      'Attach a screenshot of the problem afterwards with add_teamboard_attachment.',
     ].join(' '),
     inputSchema: {
       title: z.string(),
       project: z.string().describe('Project code (e.g. TB, TP5) or project name'),
-      type: z.string().describe(`One of: ${typesText}`),
-      priority: z.string().describe(`One of: ${prioritiesText}`),
+      type: z.string().optional().describe(`One of: ${typesText} (default Task)`),
+      priority: z.string().optional().describe(`One of: ${prioritiesText} (default Low)`),
       description: z.string().optional().describe(HTML_NOTE),
       assignee: z.string().optional().describe("Person's name or email — must be a member of the project"),
       reporters: z.array(z.string()).optional().describe('Reporter names or emails (defaults to you)'),
@@ -384,8 +413,8 @@ tool(
     const taskData = {
       title: args.title,
       projectId: String(project._id),
-      taskType: normalizeValue(args.type, vocab.taskTypes, 'task type'),
-      priority: normalizeValue(args.priority, vocab.priorities, 'priority'),
+      taskType: normalizeValue(args.type ?? 'Task', vocab.taskTypes, 'task type'),
+      priority: normalizeValue(args.priority ?? 'Low', vocab.priorities, 'priority'),
       ...(args.status ? { status: normalizeValue(args.status, vocab.statuses, 'status') } : {}),
       // Left unnormalised on purpose: the project's own list may differ from the
       // workspace one, and only the server knows which applies.
@@ -769,7 +798,7 @@ tool(
   {
     name: 'start_teamboard_timer',
     title: 'Start the timer on a TeamBoard task',
-    description: 'Start tracking time. One foreground timer at a time — starting another pauses it. Moving a task into an in-progress status already starts its timer, so use this only to track without a status change.',
+    description: 'Start tracking time. How many foreground and background timers can run at once is a workspace setting (default 1 foreground, 2 background); at the limit the server asks for a trackerDecision. Moving a task into an in-progress status already starts its timer, so use this only to track without a status change.',
     inputSchema: {
       task: TASK_REF,
       mode: z.enum(['foreground', 'background']).optional()

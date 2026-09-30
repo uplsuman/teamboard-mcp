@@ -42,6 +42,51 @@ what you want it to do:
 MCP servers only pick up env changes on restart — run `/mcp` to reconnect after
 changing the token.
 
+## Working rules
+
+The server sends these to every client as its **instructions**, so an agent follows
+them without being told each time. The text lives in `INSTRUCTIONS` in `index.js`;
+change both together.
+
+**Writing tickets and comments**
+
+- Write for a person, not a codebase: what the user sees, what was wrong, what happens
+  now, how to check it. Function names and file paths belong in the PR.
+- `description` and `comment` are literal HTML (`<h3>`, `<p>`, `<ul>/<li>`, `<strong>`,
+  `<code>`). Send the tags raw. `&lt;p&gt;` is stored as-is and shows up as text.
+- A task's `endDate` is labelled **Due Date**.
+- No AI or tool attribution ("Generated with…", "Co-Authored-By") in ticket text.
+- Typing `@Name` notifies nobody (a real mention needs the user's id, which this server
+  never exposes). Bring someone in with `edit_teamboard_task { addWatcher }`.
+
+**Screenshots**
+
+- **Creating a ticket:** attach a screenshot of the problem (`add_teamboard_attachment`
+  right after `create_teamboard_task`) and mention it in the description.
+- **After a fix:** comment with a screenshot of the fixed behaviour
+  (`comment_teamboard_task { files }`). The same screenshot goes in the PR description.
+
+**Creating**
+
+- Search first (`search_teamboard_tasks`) to catch duplicates.
+- Follow-up work related to an open ticket goes on that ticket as a comment or edit,
+  not a new ticket.
+- Type defaults to **Task** and priority to **Low**. Don't ask for them.
+
+**Working a ticket**
+
+- **Before writing code:** move the ticket to an in-progress status with
+  `trackerDecision: "foreground"`, which starts its timer. No ticket for the work? Ask,
+  or create one.
+- If a foreground timer is already running (it may belong to another session), use
+  `"background"`. Never pause or stop the other timer. `log_teamboard_time` is for time
+  that was genuinely missed, not the normal way to record work.
+- Moving into in-progress needs a due date. Changing an active task's due date needs a
+  `clarification` (10+ characters, 2+ words).
+- Entering a **testing** or **done** status needs a `resolution`.
+- **PR raised:** move the ticket to *PR In Review* and stop its timer with
+  `stop_teamboard_timer`. The status change alone may not stop it.
+
 ## Tools
 
 | Tool | What it does |
@@ -49,7 +94,7 @@ changing the token.
 | `search_teamboard_tasks` | Find tasks by keyword and/or filters — `assignee` (incl. `"me"`), `project`, `status[]`, `priority[]`, `type[]`, `dueBefore`, `dueAfter` — or raw `jql`, or a `savedFilter` by name. Call before creating, to catch duplicates. |
 | `search_teamboard` | One query across tasks, projects, people, departments and saved filters. |
 | `get_teamboard_task` | Full detail for one task, plus any of `include: ["comments","subtasks","links","attachments","history","time"]`. Comment ids are printed for the edit/delete tools. |
-| `create_teamboard_task` | Create a task. Project by code or name, assignee/reporters by name. |
+| `create_teamboard_task` | Create a task. Project by code or name, assignee/reporters by name. Type defaults to Task, priority to Low. |
 | `edit_teamboard_task` | Update title, description, status, priority, type, assignee, reporters, dates, progress, tags, project, parent task, watchers. |
 | `create_teamboard_subtask` | Add a subtask under a task; inherits the parent's project. |
 | `link_teamboard_tasks` / `unlink_teamboard_tasks` | Typed relationships: blocks, blocked_by, clones, cloned_by, splits_into, splits_from, causes, caused_by, duplicate_of, relates_to. The inverse is implied. |
@@ -62,7 +107,7 @@ changing the token.
 | `download_teamboard_attachment` | Save an attachment to a local file. |
 | `delete_teamboard_attachment` | Detach a file and delete it from storage. |
 | `log_teamboard_time` | Record work already done (minutes). Manual entries start **pending approval**. |
-| `start_teamboard_timer` / `stop_teamboard_timer` | Run the clock on a task. One foreground timer at a time. |
+| `start_teamboard_timer` / `stop_teamboard_timer` | Run the clock on a task. How many foreground and background timers can run at once is a workspace setting (default 1 and 2). |
 | `my_teamboard_timers` | What you are tracking right now, and for how long. |
 | `list_teamboard_filters` / `save_teamboard_filter` / `delete_teamboard_filter` | Saved JQL queries; run one with `search_teamboard_tasks { savedFilter }`. |
 | `list_teamboard_tags` | The workspace tag vocabulary — reuse a name rather than inventing a variant. |
@@ -85,15 +130,17 @@ Notes that bite:
   the workspace list, so the value is sent as given and the server judges it.
 - Moving a task to another project **changes its task id**; the tool reports the new one.
 - **Two arguments are mandatory for the moves that need them, not optional extras:**
-  - `resolution` — moving a task into a **done** status (Completed, Cancelled, Closed…).
-    A status says where a task is; the resolution says how it ended, and the move is
-    refused without one.
+  - `resolution` — moving a task into a **testing** or **done** status (In Testing,
+    Completed, Cancelled, Closed…). A status says where a task is; the resolution says
+    how it ended, and the move is refused without one. Testing → done carries the
+    resolution already given, so it isn't asked twice.
   - `trackerDecision` — moving a task into an **in-progress** status, which would start
     the assignee's timer. Pass `skip` to change the status without starting a timer, or
     `foreground` to start it. The other values resolve a clash when that person is
     already tracking something.
 - Other server rules surface as tool errors and need a follow-up argument:
-  `clarification` (10+ chars) when an active task's due date or status changes.
+  `clarification` (10+ chars, 2+ words) when an active task's due date changes, and a
+  due date before a task can move into in-progress ("Please add the end date first").
 
 ## Development
 
