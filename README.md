@@ -52,6 +52,8 @@ change both together.
 
 - Write for a person, not a codebase: what the user sees, what was wrong, what happens
   now, how to check it. Function names and file paths belong in the PR.
+- Keep comments short: a fix comment is two or three sentences (what was wrong, what
+  happens now) plus the screenshot, not a report with headings and lists.
 - `description` and `comment` are literal HTML (`<h3>`, `<p>`, `<ul>/<li>`, `<strong>`,
   `<code>`). Send the tags raw. `&lt;p&gt;` is stored as-is and shows up as text.
 - A task's `endDate` is labelled **Due Date**.

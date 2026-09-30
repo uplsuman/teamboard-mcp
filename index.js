@@ -38,6 +38,7 @@ const INSTRUCTIONS = `Working rules for TeamBoard. Follow them without being ask
 
 Writing tickets and comments
 - Write for a person, not a codebase: what the user sees, what was wrong, what happens now, how to check it. Leave function names and file paths to the PR.
+- Keep comments short: a fix comment is two or three sentences (what was wrong, what happens now) plus the screenshot, not a report with headings and lists.
 - description and comment are literal HTML (<h3>, <p>, <ul>/<li>, <strong>, <code>). Send the tags raw. Never HTML-escape them: &lt;p&gt; is stored and shown as text.
 - A task's endDate is labelled "Due Date".
 - No AI or tool attribution ("Generated with…", "Co-Authored-By") in ticket text.
