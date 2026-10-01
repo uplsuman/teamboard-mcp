@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import {
   attachmentPath, fetchVocab, formatDate, isClear, isObjectId, looksLikeTaskId,
   normalizeValue, invalidateCache, pickOne, resolveProject, resolveTask, resolveUser,
+  expandMentions, mentionChip,
 } from './resolve.js';
 
 process.env.TEAMBOARD_TOKEN = 'tbp_test';
@@ -210,5 +211,22 @@ assert.deepEqual(vocab.statuses, ['To Do', 'Completed']);
 // listOr() and normalizeValue() both branch on `.length`.
 routes = { '/api/tasks/meta': { taskTypes: [], priorities: [] }, '/api/tasks/statuses': [] };
 assert.deepEqual((await fetchVocab()).resolutions, []);
+
+// ── mentions ─────────────────────────────────────────────────────────────────
+// "@[Name]" becomes the editor's exact chip (the only shape the server reads as a
+// mention); a bare "@Name" is untouched; an ambiguous name refuses with candidates.
+invalidateCache();
+const RUDRA = '6a225a3ac84ea6f8006be57e';
+stub({
+  '/api/users?search=Rudra': { users: [{ _id: RUDRA, name: 'Rudra Chakraborty', email: 'rudra@x.com' }] },
+  '/api/users?search=Sa': { users: [{ _id: 'a'.repeat(24), name: 'Sam' }, { _id: 'b'.repeat(24), name: 'Sara' }] },
+});
+const out = await expandMentions('<p>@[Rudra] please verify, cc @Rudra and @[Rudra]</p>');
+const chip = mentionChip(RUDRA, 'Rudra Chakraborty');
+assert.ok(chip.includes(`class="mention"`) && chip.includes(`data-id="${RUDRA}"`));
+assert.equal(out, `<p>${chip} please verify, cc @Rudra and ${chip}</p>`);
+assert.equal(await expandMentions('<p>no mentions</p>'), '<p>no mentions</p>');
+await rejects(() => expandMentions('<p>@[Sa]</p>'), /matches 2 users/);
+assert.ok(mentionChip(RUDRA, '<b>"x"</b>').includes('&lt;b&gt;&quot;x&quot;&lt;/b&gt;')); // name is escaped
 
 console.log('all resolution checks passed');

@@ -172,6 +172,30 @@ async function resolveUserUncached(ref, projectId) {
   return String(hit._id);
 }
 
+// "@[Rudra Chakraborty]" or "@[rudra@acme.com]" in rich text becomes a real mention chip:
+// the person is notified and added as a watcher. A plain "@Rudra" is left alone, because
+// nothing marks where a bare name ends. The chip is the exact markup TeamBoard's editor
+// writes (mentionMarkup.ts), since that is the only shape the server reads as a mention.
+const MENTION_REF = /@\[([^\]\n]{1,100})\]/g;
+const escHtml = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+export const mentionChip = (id, name) =>
+  `<span class="mention" data-index="0" data-denotation-char="@" data-id="${escHtml(id)}" data-value="${escHtml(name)}">` +
+  `<span><span class="ql-mention-denotation-char">@</span>${escHtml(name)}</span></span>`;
+
+export async function expandMentions(html) {
+  if (!html || !html.includes('@[')) return html;
+  const refs = [...new Set([...html.matchAll(MENTION_REF)].map((m) => m[1].trim()))];
+  const chips = new Map();
+  for (const ref of refs) {
+    const id = await resolveUser(ref); // ambiguous or unknown → throws with the candidates
+    // The name comes from the search, not /api/users/:id, which is session-only.
+    const { users = [] } = await api(`/api/users?search=${enc(ref)}&limit=20&userStatus=active`);
+    chips.set(ref, mentionChip(id, users.find((u) => String(u._id) === id)?.name ?? ref));
+  }
+  return html.replace(MENTION_REF, (_, ref) => chips.get(ref.trim()));
+}
+
 export async function resolveProject(ref) {
   return cached(`project:${String(ref).trim().toLowerCase()}`, () => resolveProjectUncached(ref));
 }

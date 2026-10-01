@@ -58,8 +58,10 @@ change both together.
   `<code>`). Send the tags raw. `&lt;p&gt;` is stored as-is and shows up as text.
 - A task's `endDate` is labelled **Due Date**.
 - No AI or tool attribution ("Generated with…", "Co-Authored-By") in ticket text.
-- Typing `@Name` notifies nobody (a real mention needs the user's id, which this server
-  never exposes). Bring someone in with `edit_teamboard_task { addWatcher }`.
+- **Mention with `@[Name]` or `@[email]`.** In any description or comment, the server
+  turns it into a real mention chip, so the person is notified and added as a watcher. The
+  name is resolved like an assignee, so an ambiguous one fails with the candidates instead of
+  tagging the wrong person. A plain `@Name` stays plain text.
 
 **Screenshots**
 
@@ -95,7 +97,7 @@ change both together.
 |---|---|
 | `search_teamboard_tasks` | Find tasks by keyword and/or filters — `assignee` (incl. `"me"`), `project`, `status[]`, `priority[]`, `type[]`, `dueBefore`, `dueAfter` — or raw `jql`, or a `savedFilter` by name. Call before creating, to catch duplicates. |
 | `search_teamboard` | One query across tasks, projects, people, departments and saved filters. |
-| `get_teamboard_task` | Full detail for one task, plus any of `include: ["comments","subtasks","links","attachments","history","time"]`. Comment ids are printed for the edit/delete tools. |
+| `get_teamboard_task` | Full detail for one task, plus any of `include: ["comments","subtasks","links","attachments","history","time","github"]`. `github` lists the task's commits (short hash, message, author, branch, date, link) and PRs (number, title, state, branches, link); read-only. Comment ids are printed for the edit/delete tools. |
 | `create_teamboard_task` | Create a task. Project by code or name, assignee/reporters by name. Type defaults to Task, priority to Low. |
 | `edit_teamboard_task` | Update title, description, status, priority, type, assignee, reporters, dates, progress, tags, project, parent task, watchers. |
 | `create_teamboard_subtask` | Add a subtask under a task; inherits the parent's project. |
@@ -121,6 +123,7 @@ Notes that bite:
 
 - **Rich text is HTML.** `description` and `comment` take literal
   `<h3>/<ul>/<li>/<strong>/<code>` markup, not plain text with newlines.
+- **Mentions are `@[Name]`** (see Working rules); the brackets are what make it a mention.
 - **An assignee must be a member of the task's project.** `list_teamboard_users`
   with `project` shows who is eligible; the assignee lookup is scoped to that
   roster, so a non-member name fails with the roster rather than picking someone.
@@ -177,6 +180,6 @@ recoverable.
 ## Requires
 
 TeamBoard with personal-access-token support on `/api/tasks`, `/api/tasks/meta`,
-`/api/tasks/statuses`, `/api/tasks/:id/{subtasks,links,activities}`, `/api/projects`,
+`/api/tasks/statuses`, `/api/tasks/:id/{subtasks,links,activities,github}`, `/api/projects`,
 `/api/projects/:id/members`, `/api/users`, `/api/users/me`, `/api/comments`,
 `/api/comments/:id` and `/api/uploads/*` (TB `dev` after Sep 2026).

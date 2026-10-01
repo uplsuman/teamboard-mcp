@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { readFile, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import {
-  api, apiRaw, attachmentPath, enc, fetchVocab, isClear, normalizeValue, pickOne,
+  api, apiRaw, attachmentPath, enc, expandMentions, fetchVocab, isClear, normalizeValue, pickOne,
   resolveProject, resolveTask, resolveUser,
   displayName, formatDate, stripHtml, taskUrl,
 } from './resolve.js';
@@ -42,7 +42,7 @@ Writing tickets and comments
 - description and comment are literal HTML (<h3>, <p>, <ul>/<li>, <strong>, <code>). Send the tags raw. Never HTML-escape them: &lt;p&gt; is stored and shown as text.
 - A task's endDate is labelled "Due Date".
 - No AI or tool attribution ("Generated with…", "Co-Authored-By") in ticket text.
-- Typing "@Name" notifies nobody. To bring someone in, add them with edit_teamboard_task { addWatcher }.
+- To mention someone, write @[Name] or @[email] in a description or comment: it becomes a real mention that notifies them and adds them as a watcher. A plain "@Name" is just text.
 
 Screenshots
 - Creating a ticket: attach a screenshot of the problem (add_teamboard_attachment right after create_teamboard_task) and mention it in the description.
@@ -60,7 +60,7 @@ Working a ticket
 - Entering a testing or done status needs a resolution.
 - PR raised: move the ticket to "PR In Review" and stop its timer with stop_teamboard_timer. The status change alone may not stop it.`;
 
-const server = new McpServer({ name: 'teamboard', version: '0.6.0' }, { instructions: INSTRUCTIONS });
+const server = new McpServer({ name: 'teamboard', version: '0.7.0' }, { instructions: INSTRUCTIONS });
 
 // Every handler funnels its errors into one MCP error result — the resolvers'
 // ambiguity messages ("matches 3 users: …") are the useful half of the output.
@@ -159,7 +159,7 @@ function pickAttachment(task, name) {
 }
 
 const TASK_REF = z.string().describe('Task ID (TASK-42) or the task title — a title is looked up for you');
-const HTML_NOTE = 'Literal HTML (<p>, <ul>, <li>, <strong>, <code>) — not plain text with newlines.';
+const HTML_NOTE = 'Literal HTML (<p>, <ul>, <li>, <strong>, <code>) — not plain text with newlines. Mention someone with @[Name] or @[email]: it becomes a real mention that notifies them.';
 
 tool(
   {
@@ -238,12 +238,12 @@ tool(
     description: [
       'Fetch one task: description, status, priority, type, project, assignee, reporters,',
       'watchers, dates, progress, tags — plus any of its comments, subtasks, linked tasks,',
-      'attachments or change history via `include` (each costs one extra request).',
+      'attachments, change history, time logs or GitHub commits and PRs via `include` (each costs one extra request).',
       'Comment ids are printed so they can be passed to edit/delete.',
     ].join(' '),
     inputSchema: {
       task: TASK_REF,
-      include: z.array(z.enum(['comments', 'subtasks', 'links', 'attachments', 'history', 'time']))
+      include: z.array(z.enum(['comments', 'subtasks', 'links', 'attachments', 'history', 'time', 'github']))
         .optional().describe('Extra sections to load'),
     },
   },
@@ -272,12 +272,15 @@ tool(
     const want = new Set(args.include ?? []);
     // Each section is an independent GET, so fetch them together — five sequential
     // awaits made a full `include` five round trips deep.
-    const [comments, subtasks, links, activities, timeLogs] = await Promise.all([
+    const [comments, subtasks, links, activities, timeLogs, github] = await Promise.all([
       want.has('comments') ? api(`/api/comments?taskId=${enc(t.taskId)}&limit=50`) : null,
       want.has('subtasks') ? api(`/api/tasks/${enc(t.taskId)}/subtasks`) : null,
       want.has('links') ? api(`/api/tasks/${enc(t.taskId)}/links`) : null,
       want.has('history') ? api(`/api/tasks/${enc(t.taskId)}/activities?limit=30`) : null,
       want.has('time') ? api(`/api/tasks/${enc(t.taskId)}/time-logs`) : null,
+      // Token access to this route is TB-209; an older server answers 401, which must not
+      // fail the whole task read.
+      want.has('github') ? api(`/api/tasks/${enc(t.taskId)}/github`).catch((e) => ({ error: e.message })) : null,
     ]);
 
     // Long threads and histories are capped: a task with 200 comments would otherwise
@@ -331,6 +334,17 @@ tool(
         `- ${formatDuration(l.duration)} ${displayName(l.user) || ''} ${formatDate(l.startTime)}`
         + `${l.isManual ? ' (manual)' : ''}${l.approvalStatus && l.approvalStatus !== 'approved' ? ` [${l.approvalStatus}]` : ''}`
         + `${l.description ? ` — ${stripHtml(l.description)}` : ''}`));
+    }
+
+    if (want.has('github')) {
+      if (github?.error) {
+        lines.push('', `GitHub: unavailable (${github.error}). This TeamBoard may predate token access to GitHub details.`);
+      } else {
+        section('Commits', (github?.commits ?? []).map((c) =>
+          `- ${c.shortSha} ${String(c.message || '').split('\n')[0]} — ${c.authorName || c.authorLogin || 'unknown'}, ${c.branch}, ${formatDate(c.pushedAt)}\n    ${c.commitUrl}`));
+        section('Pull requests', (github?.prs ?? []).map((p) =>
+          `- #${p.number} ${p.title} [${p.state}] ${p.headBranch} → ${p.baseBranch}${p.mergedAt ? `, merged ${formatDate(p.mergedAt)}` : ''}\n    ${p.prUrl}`));
+      }
     }
 
     lines.push('', taskUrl(t.taskId));
@@ -420,7 +434,7 @@ tool(
       // Left unnormalised on purpose: the project's own list may differ from the
       // workspace one, and only the server knows which applies.
       ...(args.resolution ? { resolution: args.resolution } : {}),
-      ...(args.description ? { description: args.description } : {}),
+      ...(args.description ? { description: await expandMentions(args.description) } : {}),
       ...(args.assignee ? { assigneeId: await resolveUser(args.assignee, String(project._id)) } : {}),
       ...(args.reporters?.length
         ? { ownerIds: await Promise.all(args.reporters.map((r) => resolveUser(r))) }
@@ -493,7 +507,7 @@ tool(
     }
 
     if (args.title !== undefined) set('title', args.title);
-    if (args.description !== undefined) set('description', args.description);
+    if (args.description !== undefined) set('description', await expandMentions(args.description));
     if (args.status !== undefined) set('status', normalizeValue(args.status, vocab.statuses, 'status'));
     if (args.priority !== undefined) set('priority', normalizeValue(args.priority, vocab.priorities, 'priority'));
     if (args.type !== undefined) {
@@ -549,7 +563,7 @@ tool(
       // With attachments the endpoint takes multipart instead of JSON.
       const form = new FormData();
       form.append('taskId', t.taskId);
-      form.append('content', args.comment);
+      form.append('content', await expandMentions(args.comment));
       if (args.replyTo) form.append('parentId', args.replyTo);
       for (const filePath of args.files) {
         const name = basename(filePath);
@@ -564,7 +578,7 @@ tool(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         taskId: t.taskId,
-        content: args.comment,
+        content: await expandMentions(args.comment),
         ...(args.replyTo ? { parentId: args.replyTo } : {}),
       }),
     });
@@ -600,7 +614,7 @@ tool(
       title: args.title,
       taskType: args.type ? normalizeValue(args.type, vocab.taskTypes, 'task type') : 'Task',
       ...(args.priority ? { priority: normalizeValue(args.priority, vocab.priorities, 'priority') } : {}),
-      ...(args.description ? { description: args.description } : {}),
+      ...(args.description ? { description: await expandMentions(args.description) } : {}),
       ...(args.assignee ? { assigneeId: await resolveUser(args.assignee, projectId) } : {}),
       ...(args.dueDate ? { endDate: args.dueDate } : {}),
     };
@@ -674,7 +688,7 @@ tool(
     await api(`/api/comments/${enc(args.commentId)}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content: args.comment }),
+      body: JSON.stringify({ content: await expandMentions(args.comment) }),
     });
     return text('Comment updated.');
   }
